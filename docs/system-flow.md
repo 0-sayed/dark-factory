@@ -2,60 +2,74 @@
 
 ```mermaid
 flowchart TB
-    H["Human"] --> C["Coding Agent<br/>(Codex)"]
-    C --> S["Dark Factory Skill<br/>Teaches the agent how to operate the system"]
-    S --> DF["Dark Factory<br/>Controls the whole repository"]
+    subgraph START["Start"]
+        direction LR
+        H["Human"] --> C["Coding Agent<br/>(Codex)"] --> S["Dark Factory Skill"]
+        P["Planning Folder<br/>Context + Task Graph"]
+    end
 
-    P["Planning Folder<br/>Context + Task Graph"] --> DF
-    DF --> SELECT["Select unblocked tasks<br/>Apply concurrency + run task limit"]
-    SELECT --> AO["Agent Orchestrator<br/>Creates and manages workers + worktrees"]
+    S --> DF["Dark Factory<br/>Selects tasks and coordinates delivery"]
+    P --> DF
+    DF --> AO["Agent Orchestrator<br/>Creates workers and worktrees"]
 
     subgraph FEATURES["Parallel Feature Work"]
         direction LR
-        F1["Feature 1<br/>AO Worker + Worktree<br/>Archon Pipeline"]
-        F2["Feature 2<br/>AO Worker + Worktree<br/>Archon Pipeline"]
-        FN["Feature N<br/>AO Worker + Worktree<br/>Archon Pipeline"]
+        F1["Feature 1<br/>AO Worker + Worktree"]
+        F2["Feature 2<br/>AO Worker + Worktree"]
+        FN["Feature N<br/>AO Worker + Worktree"]
+        F1 ~~~ F2 ~~~ FN
     end
 
-    AO --> F1
-    AO --> F2
-    AO --> FN
+    AO --> FEATURES
+    FEATURES --> LIFECYCLE["Every feature follows<br/>the same Archon lifecycle"]
 
     subgraph PIPELINE["Inside Every Feature: Archon Workflows"]
-        direction TB
+        direction LR
 
-        INFRA["Start infrastructure"]
-        INFRA --> SERVERS["Start servers"]
-        SERVERS --> PLAN["Plan the selected task"]
-        PLAN --> IMPLEMENT["Implement + validate"]
-        IMPLEMENT --> QA["Frontend QA when needed"]
-        QA --> ROADMAP["Mark task complete in roadmap"]
-        ROADMAP --> PR["Commit + open pull request"]
+        subgraph FEATURE["auto-feature"]
+            direction TB
+            INFRA["Start infrastructure"]
+            SERVERS["Start servers"]
+            PLAN["Plan the selected task"]
+            IMPLEMENT["Implement + validate"]
+            QA["Frontend QA when needed"]
+            ROADMAP["Mark task complete"]
+            PR["Commit + open pull request"]
 
-        PR --> AS["auto-squash"]
-        AS --> SCAN["Scan review feedback + CI"]
-        SCAN --> FIX["Fix issues + validate + resolve threads"]
-        FIX --> MORE{"More feedback?"}
-        MORE -->|Yes| SCAN
-        MORE -->|No| MG["merge-gate"]
+            INFRA --> SERVERS --> PLAN --> IMPLEMENT --> QA --> ROADMAP --> PR
+        end
 
-        MG --> PREFLIGHT["Check CI + mergeability + branch freshness"]
-        PREFLIGHT --> PROBLEM{"Stale branch or conflicts?"}
-        PROBLEM -->|Yes| REPAIR["Update branch or resolve conflicts<br/>Validate + QA when needed"]
-        REPAIR --> PREFLIGHT
-        PROBLEM -->|No| READY["Pull request ready"]
+        subgraph REVIEW["auto-squash"]
+            direction TB
+            SCAN["Scan reviews + CI"]
+            FIX["Fix + validate"]
+            RESOLVE["Resolve review threads"]
+            MORE{"More feedback?"}
+
+            SCAN --> FIX --> RESOLVE --> MORE
+            MORE -->|Yes| SCAN
+        end
+
+        subgraph GATE["merge-gate"]
+            direction TB
+            PREFLIGHT["Check CI, freshness,<br/>and mergeability"]
+            PROBLEM{"Stale or conflicting?"}
+            REPAIR["Update or resolve<br/>then validate"]
+            READY["Ready for merge"]
+
+            PREFLIGHT --> PROBLEM
+            PROBLEM -->|Yes| REPAIR --> PREFLIGHT
+            PROBLEM -->|No| READY
+        end
+
+        PR --> SCAN
+        MORE -->|No| PREFLIGHT
     end
 
-    F2 -.->|"Pipeline detail"| INFRA
-
-    F1 --> PRS["Ready Pull Requests"]
-    F2 --> PRS
-    FN --> PRS
-    READY -.-> PRS
-
-    PRS --> QUEUE["Dark Factory Merge Queue<br/>Priority order + one merge at a time"]
+    LIFECYCLE --> INFRA
+    READY --> PRS["Ready Pull Requests"]
+    PRS --> QUEUE["Dark Factory Merge Queue"]
     QUEUE --> GH["GitHub Merge"]
-    GH --> SYNC["Reconcile Task Graph + worker state"]
-    SYNC --> CLEAN["Clean workers, worktrees, browsers, and Docker"]
-    CLEAN -->|"Schedule next eligible tasks"| DF
+    GH --> CLEAN["Reconcile tasks<br/>Clean workers and resources"]
+    CLEAN --> NEXT["Continue until the Task Graph is complete"]
 ```
