@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+# chrome-launch: Launch Chrome automation instance
+#
+# Detects worktree index for a unique debug port. By default, each launch uses
+# one small persistent automation profile per worktree. This keeps logins stable
+# without touching the main browser profile. Set CHROME_PROFILE_MODE=temp for a
+# disposable session.
+#
+# Usage:
+#   chrome-launch                           # Launch Chrome
+#   chrome-launch <url>                     # Launch and open URL
+#   CHROME_PROFILE_MODE=temp chrome-launch  # Use a disposable profile
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+URL=""
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        http://*|https://*)
+            URL="$1"
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+# Detect worktree index
+get_worktree_index() {
+    # Use git rev-parse to get the exact worktree root (not just pwd),
+    # then do an exact match against the worktree list.
+    # Prefix matching breaks because all worktrees live inside the main repo dir.
+    local current_root
+    current_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)
+    local index=0
+    while IFS= read -r -d '' field; do
+        [[ "$field" == worktree\ * ]] || continue
+        local wt_path
+        wt_path=${field#worktree }
+        wt_path=$(cd "$wt_path" 2>/dev/null && pwd -P || echo "$wt_path")
+        [[ "$current_root" == "$wt_path" ]] && echo "$index" && return
+        ((index++))
+    done < <(git worktree list --porcelain -z 2>/dev/null)
+    echo "0"
+}
+
+WT_INDEX=$(get_worktree_index)
+DEBUG_PORT=$((9222 + WT_INDEX))
+SESSION="wt${WT_INDEX}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/vercel-browser"
+PROFILE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/vercel-browser/profiles"
+STATE_FILE="$STATE_DIR/${SESSION}.env"
+LOG_FILE="$STATE_DIR/${SESSION}.log"
+PROFILE_MODE="${CHROME_PROFILE_MODE:-worktree}"
+mkdir -p "$STATE_DIR" "$PROFILE_ROOT"
+
+cdp_ready() {
+    curl -fsS --max-time 1 "http://127.0.0.1:${1}/json/version" > /dev/null 2>&1
+}
+
+auth_auto_load_enabled() {
+    local setting="${BROWSER_AUTH_AUTO_LOAD:-}"
+    case "${setting,,}" in
+        0|false|no|off)
+            return 1
+            ;;
+        1|true|yes|on)
+            return 0
+            ;;
+    esac
+
+    [[ -n "$URL" ]] && is_local_auth_url "$URL"
+}
+
+is_local_auth_url() {
+    command -v node > /dev/null 2>&1 || return 1
+    node -e '
+const value = process.argv[1];
+try {
+  const url = new URL(value);
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/^\.+/, "").replace(/\.$/, "");
+  const local = (url.protocol === "http:" || url.protocol === "https:")
+    && (host === "localhost" || host.endsWith(".localhost") || host === "127.0.0.1" || host === "0.0.0.0" || host === "::1");
+  process.exit(local ? 0 : 1);
+} catch {
+  process.exit(1);
+}
+' "$1"
+}
+
+try_load_browser_auth() {
+    auth_auto_load_enabled || return 0
+    [[ -n "$URL" ]] || return 0
+
+    if ! is_local_auth_url "$URL"; then
+        echo "browser-auth auto-load skipped: non-local URL"
+        return 0
+    fi
+
+    if [[ "${BROWSER_AUTH_ENSURE:-}" =~ ^(1|true|yes|on)$ || -n "${BROWSER_AUTH_VERIFY_URL:-}" ]]; then
+        try_ensure_browser_auth
+        return 0
+    fi
+
+    local skills_dir="${AGENTS_SKILLS_DIR:-${HOME}/.agents/skills}"
+    local auth_load="${skills_dir}/browser-auth/scripts/chrome-auth-load"
+    if [[ ! -x "$auth_load" && ! -f "$auth_load" ]]; then
+        echo "browser-auth auto-load skipped: browser-auth skill not installed"
+        return 0
+    fi
+
+    local output
+    if [[ -n "${BROWSER_AUTH_NAME:-}" ]]; then
+        if output=$(bash "$auth_load" "$URL" "$BROWSER_AUTH_NAME" 2>&1); then
+            printf '%s\n' "$output"
+            return 0
+        fi
+
+        echo "browser-auth alias load skipped: $(printf '%s\n' "$output" | tail -n 1)"
+    fi
+
+    if output=$(bash "$auth_load" "$URL" 2>&1); then
+        printf '%s\n' "$output"
+        return 0
+    fi
+
+    echo "browser-auth auto-load skipped: $(printf '%s\n' "$output" | tail -n 1)"
+}
+
+try_ensure_browser_auth() {
+    local skills_dir="${AGENTS_SKILLS_DIR:-${HOME}/.agents/skills}"
+    local auth_ensure="${skills_dir}/browser-auth/scripts/chrome-auth-ensure"
+    if [[ ! -x "$auth_ensure" && ! -f "$auth_ensure" ]]; then
+        echo "browser-auth ensure skipped: browser-auth skill not installed"
+        return 0
+    fi
+
+    local output
+    if [[ -n "${BROWSER_AUTH_NAME:-}" ]]; then
+        if output=$(bash "$auth_ensure" "$URL" "$BROWSER_AUTH_NAME" 2>&1); then
+            printf '%s\n' "$output"
+            return 0
+        fi
+
+        echo "browser-auth ensure skipped: $(printf '%s\n' "$output" | tail -n 1)"
+        return 0
+    fi
+
+    if output=$(bash "$auth_ensure" "$URL" 2>&1); then
+        printf '%s\n' "$output"
+        return 0
+    fi
+
+    echo "browser-auth ensure skipped: $(printf '%s\n' "$output" | tail -n 1)"
+}
+
+load_previous_state() {
+    if [[ -f "$STATE_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$STATE_FILE"
+    fi
+}
+
+cleanup_previous_temp_profile() {
+    load_previous_state
+
+    if [[ "${PROFILE_MODE_OLD:-}" == "temp" && -n "${PROFILE_OLD:-}" && -d "${PROFILE_OLD:-}" ]]; then
+        if [[ -n "${PID_OLD:-}" ]] && kill -0 "${PID_OLD:-}" 2>/dev/null; then
+            return 0
+        fi
+        rm -rf "$PROFILE_OLD"
+    fi
+
+    rm -f "$STATE_FILE"
+}
+
+write_state() {
+    printf 'PID_OLD=%q\nPROFILE_OLD=%q\nPROFILE_MODE_OLD=%q\n' "$1" "$2" "$3" > "$STATE_FILE"
+}
+
+allocate_profile() {
+    case "$PROFILE_MODE" in
+        worktree)
+            local profile="$PROFILE_ROOT/$SESSION"
+            mkdir -p "$profile"
+            echo "$profile"
+            ;;
+        temp)
+            mktemp -d "$STATE_DIR/${SESSION}-profile-XXXXXX"
+            ;;
+        *)
+            echo "Error: unsupported CHROME_PROFILE_MODE=$PROFILE_MODE (use temp or worktree)" >&2
+            exit 1
+            ;;
+    esac
+}
+
+slim_profile() {
+    local profile=$1
+
+    # Keep auth/session data, drop bulky caches that Chrome can rebuild.
+    rm -rf \
+        "$profile/Default/Cache" \
+        "$profile/Default/Code Cache" \
+        "$profile/Default/GPUCache" \
+        "$profile/Default/DawnCache" \
+        "$profile/Default/GrShaderCache" \
+        "$profile/Default/GraphiteDawnCache" \
+        "$profile/Default/Session Storage" \
+        "$profile/ShaderCache" \
+        "$profile/component_crx_cache" \
+        "$profile/Crash Reports" \
+        "$profile/BrowserMetrics" 2>/dev/null || true
+}
+
+show_failure() {
+    echo "Chrome failed to become ready on port $DEBUG_PORT" >&2
+    if [[ -f "$LOG_FILE" ]]; then
+        echo "Recent Chrome log:" >&2
+        tail -n 20 "$LOG_FILE" >&2 || true
+    fi
+    exit 1
+}
+
+echo "Worktree: $WT_INDEX | Port: $DEBUG_PORT | Session: $SESSION | Profile mode: $PROFILE_MODE"
+
+# Check if already running
+if cdp_ready "$DEBUG_PORT"; then
+    echo "Chrome already running on port $DEBUG_PORT"
+else
+    if pgrep -f -- "remote-debugging-port=$DEBUG_PORT" > /dev/null; then
+        echo "Removing stale Chrome process on port $DEBUG_PORT"
+        pkill -f -- "remote-debugging-port=$DEBUG_PORT" || true
+        sleep 1
+    fi
+
+    cleanup_previous_temp_profile
+    PROFILE=$(allocate_profile)
+    slim_profile "$PROFILE"
+    LAUNCH_URL="${URL:-about:blank}"
+
+    echo "Launching Chrome..."
+    # Start Chrome in a new session so it survives the parent shell exiting.
+    CHROME_WINDOW_ARGS=(
+        --window-position="${CHROME_WINDOW_POSITION:-0,0}"
+        --window-size="${CHROME_WINDOW_SIZE:-1920,1080}"
+    )
+
+    setsid google-chrome \
+        --remote-debugging-port="$DEBUG_PORT" \
+        --user-data-dir="$PROFILE" \
+        --no-first-run \
+        --no-default-browser-check \
+        --disable-extensions \
+        --disable-sync \
+        --disable-background-networking \
+        --disk-cache-size=10485760 \
+        --media-cache-size=1048576 \
+        "${CHROME_WINDOW_ARGS[@]}" \
+        "$LAUNCH_URL" >"$LOG_FILE" 2>&1 </dev/null &
+    CHROME_PID=$!
+
+    # Wait for Chrome to be ready
+    echo "Waiting for Chrome to start..."
+    for i in {1..30}; do
+        if ! kill -0 "$CHROME_PID" 2>/dev/null; then
+            show_failure
+        fi
+        if cdp_ready "$DEBUG_PORT"; then
+            echo "Chrome ready on port $DEBUG_PORT"
+            write_state "$CHROME_PID" "$PROFILE" "$PROFILE_MODE"
+            break
+        fi
+        sleep 0.5
+    done
+
+    if ! cdp_ready "$DEBUG_PORT"; then
+        show_failure
+    fi
+
+fi
+
+try_load_browser_auth
+
+echo ""
+echo "Ready. Use: agent-browser --session $SESSION --cdp $DEBUG_PORT <command>"
+
+# Export for convenience
+export DEBUG_PORT
+export SESSION

@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+PROJECT_DIR="$TMP_DIR/project"
+BIN_DIR="$TMP_DIR/bin"
+HOME_DIR="$TMP_DIR/home"
+STATE_DIR="$TMP_DIR/state/vercel-browser/auth"
+STATE_LOG="$TMP_DIR/state-call.json"
+STATE_BIN="$TMP_DIR/chrome-auth-state.mjs"
+
+mkdir -p "$PROJECT_DIR" "$BIN_DIR" "$HOME_DIR" "$STATE_DIR"
+
+cat > "$BIN_DIR/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  rev-parse)
+    echo "$TEST_PROJECT_DIR"
+    ;;
+  worktree)
+    echo "$TEST_PROJECT_DIR abcdef [main]"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+EOF
+
+cat > "$BIN_DIR/curl" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+
+cat > "$STATE_BIN" <<'EOF'
+import fs from 'node:fs';
+fs.writeFileSync(process.env.TEST_STATE_LOG, JSON.stringify(process.argv.slice(2)));
+EOF
+
+chmod +x "$BIN_DIR/git" "$BIN_DIR/curl"
+
+cat > "$STATE_DIR/http___127.0.0.1_3000.json" <<'EOF'
+{
+  "savedAt": "2026-01-01T00:00:00.000Z",
+  "url": "http://127.0.0.1:3000",
+  "cookies": [{ "name": "sid", "value": "cookie-only", "domain": "127.0.0.1", "path": "/" }],
+  "origins": [{ "origin": "http://127.0.0.1:3000", "localStorage": [], "sessionStorage": [] }]
+}
+EOF
+
+cat > "$STATE_DIR/local-app-auth.json" <<'EOF'
+{
+  "savedAt": "2026-01-01T00:00:00.000Z",
+  "url": "http://localhost:5174",
+  "cookies": [{ "name": "session", "value": "abc", "domain": "localhost", "path": "/" }],
+  "origins": [{
+    "origin": "http://localhost:5174",
+    "localStorage": [{ "name": "selectedWorkspace", "value": "demo" }],
+    "sessionStorage": []
+  }]
+}
+EOF
+
+run_load() {
+    (
+        cd "$PROJECT_DIR"
+        env \
+            HOME="$HOME_DIR" \
+            PATH="$BIN_DIR:$PATH" \
+            TEST_PROJECT_DIR="$PROJECT_DIR" \
+            TEST_STATE_LOG="$STATE_LOG" \
+            XDG_STATE_HOME="$TMP_DIR/state" \
+            CHROME_AUTH_STATE_BIN="$STATE_BIN" \
+            bash "$SCRIPT_DIR/chrome-auth-load" "$@"
+    )
+}
+
+run_load http://127.0.0.1:5173
+
+node - "$STATE_LOG" "$STATE_DIR/local-app-auth.json" <<'NODE'
+const fs = require('node:fs');
+const [logFile, expectedFile] = process.argv.slice(2);
+const args = JSON.parse(fs.readFileSync(logFile, 'utf8'));
+const fileIndex = args.indexOf('--file');
+if (fileIndex === -1 || args[fileIndex + 1] !== expectedFile) {
+  throw new Error(`Expected discovered auth file ${expectedFile}, got ${JSON.stringify(args)}`);
+}
+NODE
+
+: > "$STATE_LOG"
+run_load http://127.0.0.1:5173 local-app-auth
+
+node - "$STATE_LOG" "$STATE_DIR/local-app-auth.json" <<'NODE'
+const fs = require('node:fs');
+const [logFile, expectedFile] = process.argv.slice(2);
+const args = JSON.parse(fs.readFileSync(logFile, 'utf8'));
+const fileIndex = args.indexOf('--file');
+if (fileIndex === -1 || args[fileIndex + 1] !== expectedFile) {
+  throw new Error(`Expected explicit auth file ${expectedFile}, got ${JSON.stringify(args)}`);
+}
+NODE
+
+echo "chrome-auth-load tests passed"

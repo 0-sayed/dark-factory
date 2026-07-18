@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+    echo "Usage: chrome-auth-load <url> [name-override]" >&2
+    exit 1
+fi
+
+TARGET_URL=$1
+AUTH_NAME=${2:-}
+
+sanitize_name() {
+    printf '%s' "$1" | sed 's/[^A-Za-z0-9._-]/_/g'
+}
+
+default_name_from_url() {
+    node -e 'console.log(new URL(process.argv[1]).origin.replace(/[^A-Za-z0-9._-]/g, "_"))' "$1"
+}
+
+get_worktree_index() {
+    local current_root
+    current_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)
+    local index=0
+    while IFS= read -r line; do
+        local wt_path
+        wt_path=$(echo "$line" | awk '{print $1}')
+        wt_path=$(cd "$wt_path" 2>/dev/null && pwd -P || echo "$wt_path")
+        [[ "$current_root" == "$wt_path" ]] && echo "$index" && return
+        ((index++))
+    done < <(git worktree list 2>/dev/null)
+    echo "0"
+}
+
+WT_INDEX=$(get_worktree_index)
+DEBUG_PORT=$((9222 + WT_INDEX))
+SESSION="wt${WT_INDEX}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/vercel-browser/auth"
+STATE_BIN="${CHROME_AUTH_STATE_BIN:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/chrome-auth-state.mjs}"
+
+discover_auth_file() {
+    local target_url=$1
+    local state_dir=$2
+
+    node - "$target_url" "$state_dir" <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+
+const [targetUrl, stateDir] = process.argv.slice(2);
+
+function normalizeHostname(hostname) {
+  return String(hostname ?? '').toLowerCase().replace(/^\[|\]$/g, '').replace(/^\.+/, '').replace(/\.$/, '');
+}
+
+function isLocalHost(hostname) {
+  const host = normalizeHostname(hostname);
+  return host === 'localhost'
+    || host.endsWith('.localhost')
+    || host === '127.0.0.1'
+    || host === '0.0.0.0'
+    || host === '::1';
+}
+
+function isLocalUrl(value) {
+  try {
+    const url = new URL(value);
+    return (url.protocol === 'http:' || url.protocol === 'https:') && isLocalHost(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function isLocalCookie(cookie) {
+  if (typeof cookie?.url === 'string') return isLocalUrl(cookie.url);
+  if (typeof cookie?.domain === 'string') return isLocalHost(cookie.domain);
+  return false;
+}
+
+if (!isLocalUrl(targetUrl) || !fs.existsSync(stateDir)) {
+  process.exit(1);
+}
+
+const candidates = [];
+for (const entry of fs.readdirSync(stateDir)) {
+  if (!entry.endsWith('.json')) continue;
+
+  const file = path.join(stateDir, entry);
+  let state;
+  try {
+    state = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    continue;
+  }
+
+  const origins = Array.isArray(state.origins) ? state.origins : [];
+  const cookies = Array.isArray(state.cookies) ? state.cookies : [];
+  const localOrigins = origins.filter((origin) => isLocalUrl(origin.origin));
+  const localCookies = cookies.filter(isLocalCookie);
+  const localStorageCount = localOrigins.reduce((count, origin) => (
+    count + (Array.isArray(origin.localStorage) ? origin.localStorage.length : 0)
+      + (Array.isArray(origin.sessionStorage) ? origin.sessionStorage.length : 0)
+  ), 0);
+
+  if (!isLocalUrl(state.url) && localOrigins.length === 0 && localCookies.length === 0) {
+    continue;
+  }
+
+  if (localOrigins.length !== origins.length || localCookies.length !== cookies.length) {
+    continue;
+  }
+
+  if (localStorageCount === 0 && localCookies.length === 0) {
+    continue;
+  }
+
+  const stats = fs.statSync(file);
+  candidates.push({
+    file,
+    score: (localStorageCount > 0 ? 1000 : 0) + (localCookies.length > 0 ? 100 : 0),
+    mtime: stats.mtimeMs,
+  });
+}
+
+candidates.sort((a, b) => b.score - a.score || b.mtime - a.mtime || a.file.localeCompare(b.file));
+if (candidates[0]) {
+  console.log(candidates[0].file);
+  process.exit(0);
+}
+
+process.exit(1);
+NODE
+}
+
+if [[ -n "$AUTH_NAME" ]]; then
+    AUTH_NAME=$(sanitize_name "$AUTH_NAME")
+    AUTH_FILE="$STATE_DIR/${AUTH_NAME}.json"
+else
+    AUTH_NAME=$(default_name_from_url "$TARGET_URL")
+    AUTH_NAME=$(sanitize_name "$AUTH_NAME")
+    AUTH_FILE="$STATE_DIR/${AUTH_NAME}.json"
+
+    if [[ ! -f "$AUTH_FILE" ]]; then
+        DISCOVERED_AUTH_FILE=$(discover_auth_file "$TARGET_URL" "$STATE_DIR" || true)
+        if [[ -n "$DISCOVERED_AUTH_FILE" ]]; then
+            AUTH_FILE="$DISCOVERED_AUTH_FILE"
+        fi
+    fi
+fi
+
+if [[ ! -f "$AUTH_FILE" ]]; then
+    echo "Auth file not found: $AUTH_FILE" >&2
+    exit 1
+fi
+
+if ! curl -fsS --max-time 1 "http://127.0.0.1:${DEBUG_PORT}/json/version" > /dev/null 2>&1; then
+    echo "Chrome is not running on port $DEBUG_PORT. Start it with chrome-launch first." >&2
+    exit 1
+fi
+
+node "$STATE_BIN" load \
+    --port "$DEBUG_PORT" \
+    --url "$TARGET_URL" \
+    --file "$AUTH_FILE"

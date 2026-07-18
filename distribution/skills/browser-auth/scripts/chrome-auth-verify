@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+    echo "Usage: chrome-auth-verify <url>" >&2
+    exit 1
+fi
+
+TARGET_URL=$1
+
+get_worktree_index() {
+    local current_root
+    current_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)
+    local index=0
+    while IFS= read -r line; do
+        local wt_path
+        wt_path=$(echo "$line" | awk '{print $1}')
+        wt_path=$(cd "$wt_path" 2>/dev/null && pwd -P || echo "$wt_path")
+        [[ "$current_root" == "$wt_path" ]] && echo "$index" && return
+        ((index++))
+    done < <(git worktree list 2>/dev/null)
+    echo "0"
+}
+
+WT_INDEX=$(get_worktree_index)
+DEBUG_PORT=$((9222 + WT_INDEX))
+EXPECT_STATUS="${BROWSER_AUTH_VERIFY_STATUS:-200-299}"
+
+if ! curl -fsS --max-time 1 "http://127.0.0.1:${DEBUG_PORT}/json/version" > /dev/null 2>&1; then
+    echo "Chrome is not running on port $DEBUG_PORT. Start it with chrome-launch first." >&2
+    exit 1
+fi
+
+node "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/chrome-auth-state.mjs" verify \
+    --port "$DEBUG_PORT" \
+    --url "$TARGET_URL" \
+    --expect-status "$EXPECT_STATUS"

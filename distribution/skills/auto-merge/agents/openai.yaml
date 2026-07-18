@@ -1,0 +1,4 @@
+interface:
+  display_name: "Auto Merge"
+  short_description: "Run auto-squash and merge-gate until a PR is ready or merged."
+  default_prompt: "Make the current PR green, then use prepare or finalize mode as requested."

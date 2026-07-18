@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+PROJECT_DIR="$TMP_DIR/project with spaces"
+BIN_DIR="$TMP_DIR/bin"
+HOME_DIR="$TMP_DIR/home"
+CUSTOM_SKILLS_DIR="$TMP_DIR/custom-skills"
+AUTH_LOG="$TMP_DIR/auth-load.log"
+ENSURE_LOG="$TMP_DIR/auth-ensure.log"
+
+mkdir -p "$PROJECT_DIR" "$BIN_DIR" "$HOME_DIR/.agents/skills/browser-auth/scripts"
+mkdir -p "$CUSTOM_SKILLS_DIR/browser-auth/scripts"
+
+cat > "$BIN_DIR/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  rev-parse)
+    echo "$TEST_PROJECT_DIR"
+    ;;
+  worktree)
+    printf 'worktree /tmp/other-worktree\0HEAD 123456\0branch refs/heads/other\0\0'
+    printf 'worktree %s\0HEAD abcdef\0branch refs/heads/main\0\0' "$TEST_PROJECT_DIR"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+EOF
+
+cat > "$BIN_DIR/curl" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+
+cat > "$HOME_DIR/.agents/skills/browser-auth/scripts/chrome-auth-load" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$TEST_AUTH_LOG"
+echo "loaded auth"
+EOF
+
+cat > "$HOME_DIR/.agents/skills/browser-auth/scripts/chrome-auth-ensure" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$TEST_ENSURE_LOG"
+echo "ensured auth"
+EOF
+
+chmod +x "$BIN_DIR/git" "$BIN_DIR/curl" "$HOME_DIR/.agents/skills/browser-auth/scripts/chrome-auth-load" "$HOME_DIR/.agents/skills/browser-auth/scripts/chrome-auth-ensure"
+cp "$HOME_DIR/.agents/skills/browser-auth/scripts/chrome-auth-load" "$CUSTOM_SKILLS_DIR/browser-auth/scripts/chrome-auth-load"
+cp "$HOME_DIR/.agents/skills/browser-auth/scripts/chrome-auth-ensure" "$CUSTOM_SKILLS_DIR/browser-auth/scripts/chrome-auth-ensure"
+
+run_launch() {
+    local url=$1
+    shift || true
+
+    (
+        cd "$PROJECT_DIR"
+        env \
+            HOME="$HOME_DIR" \
+            PATH="$BIN_DIR:$PATH" \
+            TEST_PROJECT_DIR="$PROJECT_DIR" \
+            TEST_AUTH_LOG="$AUTH_LOG" \
+            TEST_ENSURE_LOG="$ENSURE_LOG" \
+            XDG_STATE_HOME="$TMP_DIR/state" \
+            XDG_CACHE_HOME="$TMP_DIR/cache" \
+            "$@" \
+            bash "$SCRIPT_DIR/chrome-launch" "$url" > "$TMP_DIR/launch.out" 2>&1
+    )
+}
+
+assert_auth_calls() {
+    local expected=$1
+    local actual=0
+    [[ -f "$AUTH_LOG" ]] && actual=$(wc -l < "$AUTH_LOG" | tr -d ' ')
+    if [[ "$actual" != "$expected" ]]; then
+        echo "Expected $expected auth load calls, got $actual" >&2
+        echo "Launch output:" >&2
+        cat "$TMP_DIR/launch.out" >&2 || true
+        exit 1
+    fi
+}
+
+assert_ensure_calls() {
+    local expected=$1
+    local actual=0
+    [[ -f "$ENSURE_LOG" ]] && actual=$(wc -l < "$ENSURE_LOG" | tr -d ' ')
+    if [[ "$actual" != "$expected" ]]; then
+        echo "Expected $expected auth ensure calls, got $actual" >&2
+        echo "Launch output:" >&2
+        cat "$TMP_DIR/launch.out" >&2 || true
+        exit 1
+    fi
+}
+
+run_launch "http://localhost:3000"
+grep -q 'Worktree: 1 |' "$TMP_DIR/launch.out"
+assert_auth_calls 1
+assert_ensure_calls 0
+
+rm -f "$AUTH_LOG" "$ENSURE_LOG"
+mv "$HOME_DIR/.agents/skills/browser-auth" "$HOME_DIR/.agents/skills/browser-auth.disabled"
+run_launch "http://localhost:3000" AGENTS_SKILLS_DIR="$CUSTOM_SKILLS_DIR"
+assert_auth_calls 1
+assert_ensure_calls 0
+mv "$HOME_DIR/.agents/skills/browser-auth.disabled" "$HOME_DIR/.agents/skills/browser-auth"
+
+rm -f "$AUTH_LOG"
+run_launch "https://example.com"
+assert_auth_calls 0
+assert_ensure_calls 0
+
+rm -f "$AUTH_LOG"
+run_launch "http://127.0.0.1:4173" BROWSER_AUTH_AUTO_LOAD=0
+assert_auth_calls 0
+assert_ensure_calls 0
+
+rm -f "$AUTH_LOG"
+run_launch "https://example.com" BROWSER_AUTH_AUTO_LOAD=1
+assert_auth_calls 0
+assert_ensure_calls 0
+
+rm -f "$AUTH_LOG" "$ENSURE_LOG"
+run_launch "http://127.0.0.1:4173" BROWSER_AUTH_VERIFY_URL=http://127.0.0.1:4172/user
+assert_auth_calls 0
+assert_ensure_calls 1
+
+echo "chrome-launch auth tests passed"

@@ -1,0 +1,36 @@
+name: auto-squash
+description: squashing bugs on autopilot
+provider: codex
+model: gpt-5.5
+
+nodes:
+  - id: check-convos
+    timeout: 600000
+    script: |
+      // Archon injects GH_TOKEN/GITHUB_TOKEN that override keyring auth and break repo resolution.
+      delete process.env.GH_TOKEN;
+      delete process.env.GITHUB_TOKEN;
+      await import(`${process.env.AGENTS_SKILLS_DIR || `${process.env.HOME}/.agents/skills`}/auto-squash/scripts/review-convo-check.mjs`);
+    runtime: bun
+
+  - id: pr-scan
+    depends_on: [check-convos]
+    when: "$check-convos.output == 'CONTINUE'"
+    context: fresh
+    prompt: |
+      Use the `pr-scan` skill to scan the current PR and update `pr.md`.
+
+  - id: pr-fix
+    depends_on: [pr-scan]
+    when: "$check-convos.output == 'CONTINUE'"
+    context: fresh
+    prompt: |
+      Fix all unchecked items under "Worth Fixing", then check what you fixed, validate, and if everything is green use the `commit` skill to commit and push.
+
+  - id: pr-resolve
+    depends_on: [pr-fix]
+    when: "$check-convos.output == 'CONTINUE'"
+    context: fresh
+    reasoning_effort: medium
+    prompt: |
+      Use the `pr-resolve` skill.

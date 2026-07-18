@@ -1,0 +1,495 @@
+#!/usr/bin/env bash
+# dev-start: Auto-detect and start dev servers for TypeScript/Node projects
+#
+# WHAT THIS DOES:
+# 1. Finds project root via git (worktree-aware) — works with Claude Code + Codex worktrees
+# 2. Prefers Makefile if present — checks for backend + frontend targets separately
+# 3. Falls back to package.json script detection
+# 4. Runs backend + frontend in parallel, forwarding Ctrl+C to both
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+DRY_RUN=false
+FILTER=""
+SCRIPT=""
+PM=""
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --dry-run) DRY_RUN=true; shift ;;
+    --filter)  FILTER="$2"; shift 2 ;;
+    --script)  SCRIPT="$2"; shift 2 ;;
+    --pm)      PM="$2"; shift 2 ;;
+    -h|--help)
+      echo "Usage: dev-start [OPTIONS]"
+      echo ""
+      echo "Options:"
+      echo "  --dry-run       Show what would run without executing"
+      echo "  --filter NAME   Filter for monorepos (e.g., @myorg/api)"
+      echo "  --script NAME   Force specific script (e.g., start:dev)"
+      echo "  --pm NAME       Force package manager (pnpm, yarn, npm)"
+      exit 0
+      ;;
+    *) echo -e "${RED}Unknown option: $1${NC}" >&2; exit 1 ;;
+  esac
+done
+
+# ── Step 1: Find project root (git worktree-aware) ────────────────────────────
+# git rev-parse --show-toplevel returns the *worktree* root, not the main repo.
+# Works correctly for: git worktrees (Claude Code, Codex), normal repos, and
+# falls back to $PWD if not in a git repo at all.
+PROJECT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")
+cd "$PROJECT_ROOT"
+
+echo -e "${BLUE}dev-start${NC}"
+echo ""
+echo -e "  Root:     ${GREEN}$PROJECT_ROOT${NC}"
+
+normalize_dev_env() {
+  local normalized_env
+  normalized_env=$(mktemp)
+  node "$SCRIPT_DIR/dev-env-normalize.mjs" \
+    --env-file .env.example \
+    --env-file .env \
+    --print-shell > "$normalized_env"
+  # shellcheck disable=SC1090
+  . "$normalized_env"
+  rm -f "$normalized_env"
+}
+
+normalize_dev_env
+
+# ── Step 2: Makefile detection ────────────────────────────────────────────────
+has_make_target() {
+  grep -qE "^$1[[:space:]]*:" Makefile 2>/dev/null
+}
+
+MAKE_BACKEND=""
+MAKE_FRONTEND=""
+
+if [[ -f "Makefile" ]]; then
+  for t in dev start serve; do
+    if has_make_target "$t"; then MAKE_BACKEND="$t"; break; fi
+  done
+  for t in web frontend client ui; do
+    if has_make_target "$t"; then MAKE_FRONTEND="$t"; break; fi
+  done
+fi
+
+# ── Step 3: package.json fallback helpers ─────────────────────────────────────
+detect_pm() {
+  [[ -n "${DEV_START_PM:-}" ]] && echo "$DEV_START_PM" && return
+  [[ -n "$PM" ]]               && echo "$PM"            && return
+  [[ -f "pnpm-lock.yaml" ]]    && echo "pnpm"           && return
+  [[ -f "yarn.lock" ]]         && echo "yarn"           && return
+  [[ -f "package-lock.json" ]] && echo "npm"            && return
+  echo "pnpm"
+}
+
+detect_script() {
+  [[ -n "${DEV_START_SCRIPT:-}" ]] && echo "$DEV_START_SCRIPT" && return
+  [[ -n "$SCRIPT" ]]               && echo "$SCRIPT"           && return
+  for s in "dev" "start:dev" "serve" "start"; do
+    grep -q "\"$s\":" package.json 2>/dev/null && echo "$s" && return
+  done
+  echo ""
+}
+
+detect_frontend_script() {
+  for s in "dev:web" "dev:frontend" "web" "frontend" "client" "ui"; do
+    grep -q "\"$s\":" package.json 2>/dev/null && echo "$s" && return
+  done
+  echo ""
+}
+
+pm_run_script() {
+  local pm="$1"
+  local script_name="$2"
+  local filter_name="${3:-}"
+
+  case "$pm" in
+    npm)
+      echo "npm run $script_name"
+      ;;
+    yarn)
+      echo "yarn $script_name"
+      ;;
+    pnpm)
+      if [[ -n "$filter_name" ]]; then
+        echo "pnpm --filter $filter_name $script_name"
+      else
+        echo "pnpm $script_name"
+      fi
+      ;;
+    *)
+      if [[ -n "$filter_name" ]]; then
+        echo "$pm --filter $filter_name $script_name"
+      else
+        echo "$pm $script_name"
+      fi
+      ;;
+  esac
+}
+
+classify_package_role() {
+  local package_file="$1"
+  local script_name="${2:-}"
+
+  node - "$package_file" "$script_name" <<'NODE'
+const fs = require('fs');
+
+const packageFile = process.argv[2];
+const scriptName = process.argv[3];
+
+let pkg;
+try {
+  pkg = JSON.parse(fs.readFileSync(packageFile, 'utf8'));
+} catch {
+  console.log('unknown');
+  process.exit(0);
+}
+
+const scripts = pkg.scripts || {};
+const deps = {
+  ...(pkg.dependencies || {}),
+  ...(pkg.devDependencies || {}),
+};
+
+const depKeys = Object.keys(deps);
+const hasDep = (names) => names.some((name) => depKeys.includes(name));
+const scriptEntries = Object.entries(scripts);
+const scriptValue = scripts[scriptName] || '';
+const scriptText = [scriptValue, ...scriptEntries.map(([, value]) => value)].join(' ');
+
+const frontendDeps = [
+  'vite',
+  'next',
+  'react',
+  'react-dom',
+  '@vitejs/plugin-react',
+  'vue',
+  'nuxt',
+  'svelte',
+  '@sveltejs/kit',
+];
+
+const backendDeps = [
+  '@nestjs/core',
+  'express',
+  'fastify',
+  'koa',
+  'hono',
+  '@fastify/core',
+];
+
+  if (
+    /(?:^|\s)(concurrently|turbo\b|nx run-many|pnpm -r|npm-run-all)(?:\s|$)/i.test(scriptValue)
+  ) {
+    console.log('orchestrator');
+    process.exit(0);
+  }
+
+  if (
+    hasDep(frontendDeps) ||
+    /(?:^|\s)(vite|next dev|next start|astro|nuxt|react-scripts)(?:\s|$)/i.test(scriptText) ||
+    'preview' in scripts
+) {
+  console.log('frontend');
+  process.exit(0);
+}
+
+if (
+  hasDep(backendDeps) ||
+  /(?:^|\s)(nest start|node |nodemon|tsx |ts-node |webpack --watch)(?:\s|$)/i.test(scriptText) ||
+  scriptName === 'start:dev'
+) {
+  console.log('backend');
+  process.exit(0);
+}
+
+console.log('unknown');
+NODE
+}
+
+preferred_script() {
+  local package_file="$1"
+  local role="${2:-backend}"
+
+  node - "$package_file" "$role" <<'NODE'
+const fs = require('fs');
+
+const packageFile = process.argv[2];
+const role = process.argv[3];
+
+let pkg;
+try {
+  pkg = JSON.parse(fs.readFileSync(packageFile, 'utf8'));
+} catch {
+  process.exit(0);
+}
+
+const scripts = pkg.scripts || {};
+const order =
+  role === 'frontend'
+    ? ['dev', 'dev:web', 'dev:frontend', 'web', 'frontend', 'client', 'ui', 'serve', 'start']
+    : ['start:dev', 'dev', 'serve', 'start'];
+
+for (const name of order) {
+  if (scripts[name]) {
+    console.log(name);
+    process.exit(0);
+  }
+}
+NODE
+}
+
+find_workspace_candidate() {
+  local role="$1"
+  local pm="$2"
+  local root_path="$3"
+
+  [[ "$pm" != "pnpm" ]] && return 0
+  command -v pnpm >/dev/null 2>&1 || return 0
+  [[ ! -f "pnpm-workspace.yaml" ]] && return 0
+
+  local workspace_json
+  workspace_json=$(pnpm ls -r --depth -1 --json 2>/dev/null || echo "[]")
+
+  WORKSPACE_JSON="$workspace_json" node - "$role" "$root_path" <<'NODE'
+const fs = require('fs');
+const path = require('path');
+
+const role = process.argv[2];
+const rootPath = process.argv[3];
+const packages = JSON.parse(process.env.WORKSPACE_JSON || '[]');
+
+const frontendDeps = new Set([
+  'vite',
+  'next',
+  'react',
+  'react-dom',
+  '@vitejs/plugin-react',
+  'vue',
+  'nuxt',
+  'svelte',
+  '@sveltejs/kit',
+]);
+
+const backendDeps = new Set([
+  '@nestjs/core',
+  'express',
+  'fastify',
+  'koa',
+  'hono',
+  '@fastify/core',
+]);
+
+const scriptOrders = {
+  frontend: ['dev', 'dev:web', 'dev:frontend', 'web', 'frontend', 'client', 'ui', 'serve', 'start'],
+  backend: ['start:dev', 'dev', 'serve', 'start'],
+};
+
+const preferredNamePatterns = {
+  frontend: /(frontend|dashboard|web|client|ui|site|app)/i,
+  backend: /(api|server|backend|gateway|app|web)/i,
+};
+
+const excludedNamePatterns = {
+  frontend: /(worker|consumer|queue|cron|scheduler|analysis|ingestion|ai|ml|inference|trainer|seed)/i,
+  backend: /(worker|consumer|queue|cron|scheduler|analysis|ingestion|ai|ml|inference|trainer|seed)/i,
+};
+
+function classify(pkg) {
+  const scripts = pkg.scripts || {};
+  const deps = {
+    ...(pkg.dependencies || {}),
+    ...(pkg.devDependencies || {}),
+  };
+  const depKeys = Object.keys(deps);
+  const hasDep = (names) => names.some((name) => depKeys.includes(name));
+  const scriptText = Object.values(scripts).join(' ');
+
+  if (
+    hasDep([...frontendDeps]) ||
+    /(?:^|\s)(vite|next dev|next start|astro|nuxt|react-scripts)(?:\s|$)/i.test(scriptText) ||
+    'preview' in scripts
+  ) {
+    return 'frontend';
+  }
+
+  if (
+    hasDep([...backendDeps]) ||
+    /(?:^|\s)(nest start|node |nodemon|tsx |ts-node |webpack --watch)(?:\s|$)/i.test(scriptText) ||
+    'start:dev' in scripts
+  ) {
+    return 'backend';
+  }
+
+  return 'unknown';
+}
+
+const ranked = [];
+
+for (const entry of packages) {
+  if (!entry.path || path.resolve(entry.path) === path.resolve(rootPath)) continue;
+
+  const packageFile = path.join(entry.path, 'package.json');
+  let pkg;
+  try {
+    pkg = JSON.parse(fs.readFileSync(packageFile, 'utf8'));
+  } catch {
+    continue;
+  }
+
+  if (classify(pkg) !== role) continue;
+
+  const scripts = pkg.scripts || {};
+  const scriptName = scriptOrders[role].find((name) => scripts[name]);
+  if (!scriptName) continue;
+
+  ranked.push({
+    name: pkg.name || path.basename(entry.path),
+    path: entry.path,
+    script: scriptName,
+    score:
+      (entry.path.includes('/apps/') ? 0 : 4) +
+      (preferredNamePatterns[role].test(`${pkg.name || ''} ${entry.path}`) ? 0 : 2) +
+      (excludedNamePatterns[role].test(`${pkg.name || ''} ${entry.path}`) ? 20 : 0),
+  });
+}
+
+ranked.sort((a, b) =>
+  a.score - b.score ||
+  a.path.localeCompare(b.path)
+);
+
+if (ranked[0]) {
+  console.log(JSON.stringify(ranked[0]));
+}
+NODE
+}
+
+# ── Step 4: Resolve commands ──────────────────────────────────────────────────
+BACKEND_CMD=""
+FRONTEND_CMD=""
+
+if [[ -n "$MAKE_BACKEND" || -n "$MAKE_FRONTEND" ]]; then
+  echo -e "  Strategy: ${GREEN}Makefile${NC}"
+  [[ -n "$MAKE_BACKEND" ]]  && BACKEND_CMD="make $MAKE_BACKEND"
+  [[ -n "$MAKE_FRONTEND" ]] && FRONTEND_CMD="make $MAKE_FRONTEND"
+elif [[ -f "package.json" ]]; then
+  echo -e "  Strategy: ${GREEN}package.json${NC}"
+  PM_USED=$(detect_pm)
+  MAIN_SCRIPT=$(detect_script)
+  ROOT_ROLE=""
+
+  if [[ -z "$MAIN_SCRIPT" ]]; then
+    echo -e "${RED}Error: No dev script found in package.json${NC}" >&2
+    echo "Looked for: dev, start:dev, serve, start" >&2
+    exit 1
+  fi
+
+  FILTER_ARG="${FILTER:-${DEV_START_FILTER:-}}"
+
+  if [[ -f "turbo.json" ]]; then
+    BACKEND_CMD="turbo run $MAIN_SCRIPT"
+  elif [[ -f "pnpm-workspace.yaml" ]]; then
+    ROOT_ROLE=$(classify_package_role "package.json" "$MAIN_SCRIPT")
+
+    ROOT_CMD=$(pm_run_script "$PM_USED" "$MAIN_SCRIPT" "$FILTER_ARG")
+
+    if [[ "$ROOT_ROLE" == "frontend" ]]; then
+      FRONTEND_CMD="$ROOT_CMD"
+    else
+      BACKEND_CMD="$ROOT_CMD"
+    fi
+  elif [[ -f "nx.json" ]]; then
+    BACKEND_CMD="nx run-many --target=$MAIN_SCRIPT"
+  else
+    BACKEND_CMD=$(pm_run_script "$PM_USED" "$MAIN_SCRIPT")
+  fi
+
+  FRONTEND_SCRIPT=$(detect_frontend_script)
+  if [[ -n "$FRONTEND_SCRIPT" && "$FRONTEND_SCRIPT" != "$MAIN_SCRIPT" ]]; then
+    FRONTEND_CMD=$(pm_run_script "$PM_USED" "$FRONTEND_SCRIPT")
+  fi
+
+  if [[ -f "pnpm-workspace.yaml" && "$PM_USED" == "pnpm" ]]; then
+    if [[ -z "$BACKEND_CMD" ]]; then
+      WORKSPACE_BACKEND=$(find_workspace_candidate "backend" "$PM_USED" "$PROJECT_ROOT")
+      if [[ -n "$WORKSPACE_BACKEND" ]]; then
+        BACKEND_NAME=$(printf '%s' "$WORKSPACE_BACKEND" | jq -r '.name')
+        BACKEND_SCRIPT=$(printf '%s' "$WORKSPACE_BACKEND" | jq -r '.script')
+        BACKEND_CMD=$(pm_run_script "$PM_USED" "$BACKEND_SCRIPT" "$BACKEND_NAME")
+      fi
+    fi
+
+    if [[ -z "$FRONTEND_CMD" ]]; then
+      WORKSPACE_FRONTEND=$(find_workspace_candidate "frontend" "$PM_USED" "$PROJECT_ROOT")
+      if [[ -n "$WORKSPACE_FRONTEND" ]]; then
+        FRONTEND_NAME=$(printf '%s' "$WORKSPACE_FRONTEND" | jq -r '.name')
+        FRONTEND_SCRIPT=$(printf '%s' "$WORKSPACE_FRONTEND" | jq -r '.script')
+        FRONTEND_CMD=$(pm_run_script "$PM_USED" "$FRONTEND_SCRIPT" "$FRONTEND_NAME")
+      fi
+    fi
+  fi
+else
+  echo -e "${RED}Error: No Makefile or package.json found in $PROJECT_ROOT${NC}" >&2
+  exit 1
+fi
+
+# ── Step 5: Report ────────────────────────────────────────────────────────────
+echo ""
+[[ -n "$BACKEND_CMD" ]]  && echo -e "  Backend:  ${YELLOW}$BACKEND_CMD${NC}"
+[[ -n "$FRONTEND_CMD" ]] && echo -e "  Frontend: ${YELLOW}$FRONTEND_CMD${NC}"
+echo ""
+
+if [[ "$DRY_RUN" == "true" ]]; then
+  echo -e "${YELLOW}Dry run — not executing${NC}"
+  exit 0
+fi
+
+echo -e "${GREEN}Starting...${NC}"
+echo ""
+
+# ── Step 6: Launch ────────────────────────────────────────────────────────────
+PIDS=()
+
+cleanup() {
+  local pid
+  for pid in "${PIDS[@]}"; do
+    pkill -TERM -P "$pid" 2>/dev/null || true
+    kill "$pid" 2>/dev/null || true
+  done
+}
+trap cleanup INT TERM
+
+if [[ -n "$BACKEND_CMD" && -n "$FRONTEND_CMD" ]]; then
+  eval "$BACKEND_CMD" &
+  PIDS+=($!)
+  echo -e "  Backend  PID ${GREEN}${PIDS[-1]}${NC}"
+
+  eval "$FRONTEND_CMD" &
+  PIDS+=($!)
+  echo -e "  Frontend PID ${GREEN}${PIDS[-1]}${NC}"
+
+  echo ""
+  echo -e "  ${YELLOW}Ctrl+C${NC} to stop both"
+  echo ""
+  wait "${PIDS[@]}"
+elif [[ -n "$BACKEND_CMD" ]]; then
+  exec $BACKEND_CMD
+elif [[ -n "$FRONTEND_CMD" ]]; then
+  exec $FRONTEND_CMD
+else
+  echo -e "${RED}Error: Nothing to start${NC}" >&2
+  exit 1
+fi

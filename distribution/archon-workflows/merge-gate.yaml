@@ -1,0 +1,287 @@
+name: merge-gate
+description: lower-level PR merge gate for mergeability, conflicts, QA, and final merge
+provider: codex
+model: gpt-5.5
+
+nodes:
+  - id: preflight
+    bash: |
+      node "${ARCHON_HOME:-$HOME/.archon}/scripts/merge-gate-preflight.mjs"
+
+  - id: merge-ready
+    depends_on: [preflight]
+    when: "$preflight.output == 'READY'"
+    bash: |
+      node "${ARCHON_HOME:-$HOME/.archon}/scripts/merge-gate-action.mjs" merge-ready
+
+  - id: block-not-green
+    depends_on: [preflight]
+    when: "$preflight.output == 'NOT_GREEN'"
+    bash: |
+      set -euo pipefail
+
+      if [ -f .archon/state/merge-gate-preflight.json ]; then
+        cat .archon/state/merge-gate-preflight.json >&2
+      else
+        echo "merge-gate preflight returned NOT_GREEN without a state file" >&2
+      fi
+
+      exit 1
+
+  - id: update-stale
+    depends_on: [preflight]
+    when: "$preflight.output == 'STALE'"
+    bash: |
+      node "${ARCHON_HOME:-$HOME/.archon}/scripts/merge-gate-action.mjs" update-branch
+
+  - id: wait-ready-after-update
+    depends_on: [update-stale]
+    when: "$update-stale.output == 'UPDATED'"
+    timeout: 7200000
+    bash: |
+      set -euo pipefail
+
+      # Archon injects GH_TOKEN/GITHUB_TOKEN that can override keyring auth and break repo resolution.
+      unset GH_TOKEN GITHUB_TOKEN
+
+      node "${ARCHON_HOME:-$HOME/.archon}/scripts/merge-gate-wait-ready.mjs" \
+        --timeout-seconds 1800 \
+        --poll-interval-seconds 30
+
+  - id: block-update-failed
+    depends_on: [update-stale]
+    when: "$update-stale.output == 'FAILED'"
+    bash: |
+      set -euo pipefail
+
+      if [ -f .archon/state/merge-gate-update.json ]; then
+        cat .archon/state/merge-gate-update.json >&2
+      else
+        echo "merge-gate update-stale failed without a state file" >&2
+      fi
+
+      exit 1
+
+  - id: start-conflict-merge
+    depends_on: [preflight]
+    when: "$preflight.output == 'CONFLICT'"
+    bash: |
+      set -euo pipefail
+
+      # Archon injects GH_TOKEN/GITHUB_TOKEN that can override keyring auth and break repo resolution.
+      unset GH_TOKEN GITHUB_TOKEN
+
+      base="$(
+        node -e "const fs=require('fs'); const s=JSON.parse(fs.readFileSync('.archon/state/merge-gate-preflight.json','utf8')); process.stdout.write(s.baseRefName || '');"
+      )"
+
+      if [ -z "$base" ]; then
+        echo "merge-gate preflight did not record a base branch" >&2
+        exit 1
+      fi
+
+      mkdir -p .archon/state
+
+      if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+        {
+          git diff --name-only --diff-filter=U
+          git diff-tree --no-commit-id --name-only -r HEAD MERGE_HEAD
+          git diff --name-only
+          git diff --cached --name-only
+        } | sort -u > .archon/state/merge-gate-conflict-files.txt
+        printf 'started'
+        exit 0
+      fi
+
+      if ! git diff --quiet || ! git diff --cached --quiet; then
+        echo "tracked working tree changes exist before conflict merge" >&2
+        exit 1
+      fi
+
+      git fetch origin "$base"
+
+      set +e
+      merge_output="$(git merge --no-commit --no-ff "origin/$base" 2>&1)"
+      merge_status=$?
+      set -e
+
+      if [ "$merge_status" -eq 0 ]; then
+        {
+          git diff-tree --no-commit-id --name-only -r HEAD "origin/$base"
+          git diff --name-only
+          git diff --cached --name-only
+        } | sort -u > .archon/state/merge-gate-conflict-files.txt
+        printf 'started'
+        exit 0
+      fi
+
+      if git diff --name-only --diff-filter=U | grep -q .; then
+        {
+          git diff --name-only --diff-filter=U
+          git diff-tree --no-commit-id --name-only -r HEAD "origin/$base"
+          git diff --name-only
+          git diff --cached --name-only
+        } | sort -u > .archon/state/merge-gate-conflict-files.txt
+        printf 'started'
+        exit 0
+      fi
+
+      printf '%s\n' "$merge_output" >&2
+      exit "$merge_status"
+
+  - id: resolve-preflight-conflict
+    depends_on: [start-conflict-merge]
+    context: fresh
+    prompt: |
+      Use the `fix-merge-conflicts` skill.
+
+      The workflow has already started a no-commit merge against the PR base branch.
+      Resolve the current merge state locally.
+      Run the repo's full local validation gate.
+      Do not commit.
+      Do not push.
+      Output exactly `resolved`.
+
+  - id: check-conflict-frontend
+    depends_on: [resolve-preflight-conflict]
+    bash: |
+      node "${ARCHON_HOME:-$HOME/.archon}/scripts/frontend-qa-context.mjs" \
+        --mode conflict \
+        --include-file .archon/state/merge-gate-conflict-files.txt
+
+  - id: ensure-dev-for-QA
+    depends_on: [check-conflict-frontend]
+    when: "$check-conflict-frontend.output == 'yes'"
+    bash: |
+      node "${ARCHON_HOME:-$HOME/.archon}/scripts/ensure-dev-ready.mjs"
+
+  - id: QA
+    depends_on: [ensure-dev-for-QA]
+    context: fresh
+    idle_timeout: 600000
+    prompt: |
+      Use the `vercel-browser` skill to QA only the frontend conflict scope recorded in:
+      .archon/state/frontend-qa-context.json
+
+      Contract:
+      - Read the QA context file first.
+      - Open the `appUrl` from that file.
+      - Do not start dev servers from this QA node. If `appUrl` is unreachable, output exactly `QA_BLOCKED`.
+      - Exercise only the changed frontend surface listed in `frontendFiles`.
+      - Fix only issues necessary for the changed frontend conflict surface to work.
+      - If the blocker is related backend/API/config/test code, make the appropriate scoped fix and re-check with focused validation plus browser QA.
+      - Prefer the fix that preserves intended product behavior and existing architecture; avoid band-aids and broad unrelated cleanup.
+      - If a backend/API request required by the changed frontend surface fails for an unrelated reason, write notes, do not write `QA_PASSED`, and output exactly `QA_BLOCKED`.
+      - If you find a conflict-resolution bug, make the appropriate scoped fix and re-check it in the browser.
+      - Write concise notes to .archon/state/frontend-qa-result.md.
+      - When the scoped browser QA passes, write exactly `QA_PASSED` to .archon/state/frontend-qa-status.txt.
+      - Output exactly `QA_PASSED`.
+
+  - id: record-QA-revision
+    depends_on: [QA]
+    bash: |
+      node "${ARCHON_HOME:-$HOME/.archon}/scripts/record-frontend-qa-revision.mjs"
+
+  - id: check-QA-passed
+    depends_on: [record-QA-revision]
+    bash: |
+      node "${ARCHON_HOME:-$HOME/.archon}/scripts/check-frontend-qa-status.mjs"
+
+  - id: push-conflict-resolution
+    depends_on: [check-conflict-frontend, check-QA-passed]
+    trigger_rule: none_failed_min_one_success
+    bash: |
+      set -euo pipefail
+
+      # Archon injects GH_TOKEN/GITHUB_TOKEN that can override keyring auth and break repo resolution.
+      unset GH_TOKEN GITHUB_TOKEN
+
+      branch="$(git branch --show-current)"
+      if [ -z "$branch" ]; then
+        echo "Cannot push conflict resolution from detached HEAD" >&2
+        exit 1
+      fi
+
+      if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+        git add -u
+        git commit --no-edit
+      elif ! git diff --quiet || ! git diff --cached --quiet; then
+        git add -u
+        git commit -m "fix: resolve merge conflicts"
+      fi
+
+      git push origin "$branch:$branch"
+
+      mkdir -p .archon/state
+      node -e "const fs=require('fs'); const v={status:'RESOLVED_PUSHED',headSha:process.argv[1],pushedAt:new Date().toISOString()}; fs.writeFileSync('.archon/state/merge-gate-resolution.json', JSON.stringify(v)+'\n');" "$(git rev-parse HEAD)"
+
+      printf 'pushed'
+
+  - id: wait-ready-after-conflict
+    depends_on: [push-conflict-resolution]
+    timeout: 7200000
+    bash: |
+      set -euo pipefail
+
+      # Archon injects GH_TOKEN/GITHUB_TOKEN that can override keyring auth and break repo resolution.
+      unset GH_TOKEN GITHUB_TOKEN
+
+      node "${ARCHON_HOME:-$HOME/.archon}/scripts/merge-gate-wait-ready.mjs" \
+        --timeout-seconds 1800 \
+        --poll-interval-seconds 30
+
+  - id: final-preflight
+    depends_on: [wait-ready-after-update, wait-ready-after-conflict]
+    trigger_rule: none_failed_min_one_success
+    bash: |
+      node "${ARCHON_HOME:-$HOME/.archon}/scripts/merge-gate-preflight.mjs"
+
+  - id: merge-after-final-preflight
+    depends_on: [final-preflight]
+    when: "$final-preflight.output == 'READY'"
+    bash: |
+      node "${ARCHON_HOME:-$HOME/.archon}/scripts/merge-gate-action.mjs" merge-ready
+
+  - id: block-final-not-ready
+    depends_on: [final-preflight]
+    when: "$final-preflight.output != 'READY'"
+    bash: |
+      set -euo pipefail
+
+      if [ -f .archon/state/merge-gate-preflight.json ]; then
+        cat .archon/state/merge-gate-preflight.json >&2
+      else
+        echo "merge-gate final preflight did not return READY and wrote no state file" >&2
+      fi
+
+      exit 1
+
+  - id: block-pending
+    depends_on: [preflight]
+    when: "$preflight.output == 'PENDING'"
+    bash: |
+      set -euo pipefail
+
+      if [ -f .archon/state/merge-gate-preflight.json ]; then
+        cat .archon/state/merge-gate-preflight.json >&2
+      else
+        echo "merge-gate preflight returned PENDING without a state file" >&2
+      fi
+
+      exit 1
+
+  - id: block-unsafe
+    depends_on: [preflight]
+    when: "$preflight.output == 'UNSAFE'"
+    bash: |
+      set -euo pipefail
+
+      if [ -f .archon/state/merge-status.json ]; then
+        cat .archon/state/merge-status.json >&2
+      elif [ -f .archon/state/merge-gate-preflight.json ]; then
+        cat .archon/state/merge-gate-preflight.json >&2
+      else
+        echo "merge-gate preflight returned UNSAFE without a state file" >&2
+      fi
+
+      exit 1
