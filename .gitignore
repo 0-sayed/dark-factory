@@ -1,0 +1,8 @@
+dark-factory.yaml
+agent-orchestrator.yaml
+.dark-factory/
+orchestrator/.dark-factory/
+projects/*.local.yaml
+docs/superpowers/plans/
+__pycache__/
+*.pyc
