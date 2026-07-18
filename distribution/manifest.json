@@ -20,7 +20,7 @@
       "source": "distribution/skills",
       "mode": "install",
       "target": ".agents/skills",
-      "sha256": "bf210a2da0e66d33e16d4b074667fc51edce0724b51d8ac27242768cf97ad1ab"
+      "sha256": "de68b15f33367b62f2e9dba2701218d82d788c09722a6723df0a81156da06935"
     },
     {
       "name": "operator-skill",

@@ -22,13 +22,14 @@ get_worktree_index() {
     local current_root
     current_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)
     local index=0
-    while IFS= read -r line; do
+    while IFS= read -r -d '' field; do
+        [[ "$field" == worktree\ * ]] || continue
         local wt_path
-        wt_path=$(echo "$line" | awk '{print $1}')
+        wt_path=${field#worktree }
         wt_path=$(cd "$wt_path" 2>/dev/null && pwd -P || echo "$wt_path")
         [[ "$current_root" == "$wt_path" ]] && echo "$index" && return
         ((index++))
-    done < <(git worktree list 2>/dev/null)
+    done < <(git worktree list --porcelain -z 2>/dev/null)
     echo "0"
 }
 
