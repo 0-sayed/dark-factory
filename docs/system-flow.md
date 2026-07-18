@@ -72,4 +72,5 @@ flowchart TB
     QUEUE --> GH["GitHub Merge"]
     GH --> CLEAN["Reconcile tasks<br/>Clean workers and resources"]
     CLEAN --> NEXT["Continue until the Task Graph is complete"]
+    NEXT -.->|"If tasks remain"| DF
 ```
