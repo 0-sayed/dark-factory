@@ -57,12 +57,16 @@ function fileMode(path) {
   return statSync(path).mode & 0o777;
 }
 
+function portableFileMode(path) {
+  return fileMode(path) & 0o111 ? 0o755 : 0o644;
+}
+
 export function hashTree(directory) {
   const digest = createHash("sha256");
   for (const file of listFiles(directory)) {
     digest.update(file.relativePath);
     digest.update("\0");
-    digest.update(fileMode(file.path).toString(8));
+    digest.update(portableFileMode(file.path).toString(8));
     digest.update("\0");
     digest.update(sha256(readFileSync(file.path)));
     digest.update("\n");

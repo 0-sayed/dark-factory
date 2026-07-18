@@ -6,34 +6,34 @@
       "source": "distribution/archon-workflows",
       "mode": "install",
       "target": ".archon/workflows",
-      "sha256": "ee6053fdd51af1e63e40b7119da35fbd1e476c3f783199b0af1aa045f2f6e191"
+      "sha256": "ed10f74e2c517e60785e98365c86187bd8e8b4bd3d1a9e8113078516f95d7472"
     },
     {
       "name": "archon-scripts",
       "source": "distribution/archon-scripts",
       "mode": "install",
       "target": ".archon/scripts",
-      "sha256": "69cfab115657d46caa8cec0cb92941338eed66dd47b8ded8cd14621005c77883"
+      "sha256": "6a679422b797c04ab4647258754396a5bc20bee9ac52af5afa069b798caa5a17"
     },
     {
       "name": "agent-skills",
       "source": "distribution/skills",
       "mode": "install",
       "target": ".agents/skills",
-      "sha256": "ae92e96cfe026bf537bd6bd0536fab5ee567131d1a69a885be0ac5b348a285bd"
+      "sha256": "bf210a2da0e66d33e16d4b074667fc51edce0724b51d8ac27242768cf97ad1ab"
     },
     {
       "name": "operator-skill",
       "source": "skills/dark-factory",
       "mode": "install",
       "target": ".agents/skills/dark-factory",
-      "sha256": "0791d3ae7239336ce8b37200941953afbb4806a8591ef644c49fed383d158d1a"
+      "sha256": "c5b9b89c9cd03305599a18419776fe98288879caf71ae53b6bd4a0461644cdad"
     },
     {
       "name": "ao-plugins",
       "source": "ao-plugins",
       "mode": "repository",
-      "sha256": "7a7a8fb8222232e4285be6b4f37f8bf8917ba333a955b387a7a47619c4f3759c"
+      "sha256": "8bc541f5f91617e4a15751c4dd886e4cf63249966ada6357228c74c13d456a28"
     }
   ]
 }

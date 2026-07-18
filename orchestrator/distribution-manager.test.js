@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -51,6 +51,29 @@ test("checked-in distribution manifest covers valid source snapshots", () => {
     results.map((result) => result.name),
     ["archon-workflows", "archon-scripts", "agent-skills", "operator-skill", "ao-plugins"],
   );
+});
+
+test("distribution hashes ignore permission bits Git does not preserve", () => {
+  const root = mkdtempSync(join(tmpdir(), "dark-factory-hash-modes-"));
+  const file = join(root, "asset.txt");
+
+  try {
+    writeFileSync(file, "portable asset\n");
+    chmodSync(file, 0o644);
+    const regularHash = hashTree(root);
+
+    chmodSync(file, 0o664);
+    assert.equal(hashTree(root), regularHash);
+
+    chmodSync(file, 0o755);
+    const executableHash = hashTree(root);
+    assert.notEqual(executableHash, regularHash);
+
+    chmodSync(file, 0o775);
+    assert.equal(hashTree(root), executableHash);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("install copies portable assets and keeps AO plugins repository-local", () => {
