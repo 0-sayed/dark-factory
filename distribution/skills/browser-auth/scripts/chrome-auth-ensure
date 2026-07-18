@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+    echo "Usage: chrome-auth-ensure <url> [name-override]" >&2
+    exit 1
+fi
+
+TARGET_URL=$1
+AUTH_NAME=${2:-}
+VERIFY_URL="${BROWSER_AUTH_VERIFY_URL:-$TARGET_URL}"
+SAVE_URL="${BROWSER_AUTH_SAVE_URL:-$VERIFY_URL}"
+LOGIN_COMMAND="${BROWSER_AUTH_LOGIN_COMMAND:-}"
+LOGIN_URL="${BROWSER_AUTH_LOGIN_URL:-}"
+LOGIN_TIMEOUT="${BROWSER_AUTH_LOGIN_TIMEOUT:-120}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOAD_BIN="${CHROME_AUTH_LOAD_BIN:-$SCRIPT_DIR/chrome-auth-load}"
+SAVE_BIN="${CHROME_AUTH_SAVE_BIN:-$SCRIPT_DIR/chrome-auth-save}"
+VERIFY_BIN="${CHROME_AUTH_VERIFY_BIN:-$SCRIPT_DIR/chrome-auth-verify}"
+
+load_auth() {
+    if [[ -n "$AUTH_NAME" ]]; then
+        "$LOAD_BIN" "$TARGET_URL" "$AUTH_NAME"
+    else
+        "$LOAD_BIN" "$TARGET_URL"
+    fi
+}
+
+save_auth() {
+    if [[ -n "$AUTH_NAME" ]]; then
+        "$SAVE_BIN" "$SAVE_URL" "$AUTH_NAME"
+    else
+        "$SAVE_BIN" "$SAVE_URL"
+    fi
+}
+
+verify_auth() {
+    "$VERIFY_BIN" "$VERIFY_URL"
+}
+
+wait_for_manual_login() {
+    local started
+    started=$(date +%s)
+    while true; do
+        if verify_auth >/dev/null 2>&1; then
+            return 0
+        fi
+
+        if (( $(date +%s) - started >= LOGIN_TIMEOUT )); then
+            echo "Timed out waiting for browser auth at $VERIFY_URL" >&2
+            return 1
+        fi
+
+        sleep 2
+    done
+}
+
+load_auth >/dev/null 2>&1 || true
+
+if verify_auth; then
+    echo "browser-auth ensure: authenticated"
+    exit 0
+fi
+
+if [[ -n "$LOGIN_COMMAND" ]]; then
+    bash -lc "$LOGIN_COMMAND"
+elif [[ -n "$LOGIN_URL" ]]; then
+    if [[ -n "$AUTH_NAME" ]]; then
+        "$LOAD_BIN" "$LOGIN_URL" "$AUTH_NAME" >/dev/null 2>&1 || true
+    else
+        "$LOAD_BIN" "$LOGIN_URL" >/dev/null 2>&1 || true
+    fi
+    echo "browser-auth ensure: waiting for login at $LOGIN_URL"
+    wait_for_manual_login
+else
+    echo "browser-auth ensure: auth is stale and no login command or login URL was provided" >&2
+    exit 1
+fi
+
+save_auth
+
+if verify_auth; then
+    echo "browser-auth ensure: authenticated"
+    exit 0
+fi
+
+echo "browser-auth ensure: login completed but verification still failed at $VERIFY_URL" >&2
+exit 1

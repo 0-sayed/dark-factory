@@ -1,0 +1,38 @@
+{
+  "lockVersion": 1,
+  "repositories": {
+    "agent-orchestrator": {
+      "repository": "https://github.com/0-sayed/agent-orchestrator.git",
+      "commit": "00226134e382afae32ca777ae050f516ad5fcf38",
+      "checkout": {
+        "environment": "DARK_FACTORY_AO_CHECKOUT",
+        "defaultSibling": "agent-orchestrator"
+      }
+    },
+    "worktree-compose": {
+      "repository": "https://github.com/0-sayed/worktree-compose.git",
+      "commit": "7a218034d054d888bfeb8c5733fddef8843e200b",
+      "checkout": {
+        "environment": "DARK_FACTORY_WTC_CHECKOUT",
+        "defaultSibling": "worktree-compose"
+      }
+    }
+  },
+  "runtimes": {
+    "agent-orchestrator": {
+      "command": "ao",
+      "versionArgs": ["version"],
+      "expectedOutput": "commit 00226134e382afae32ca777ae050f516ad5fcf38"
+    },
+    "worktree-compose": {
+      "command": "wtc",
+      "versionArgs": ["--version"],
+      "expectedOutput": "0.2.0"
+    },
+    "archon": {
+      "command": "archon",
+      "versionArgs": ["version"],
+      "expectedOutput": "Archon CLI v0.5.0"
+    }
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "manifestVersion": 1,
+  "assets": [
+    {
+      "name": "archon-workflows",
+      "source": "distribution/archon-workflows",
+      "mode": "install",
+      "target": ".archon/workflows",
+      "sha256": "ed10f74e2c517e60785e98365c86187bd8e8b4bd3d1a9e8113078516f95d7472"
+    },
+    {
+      "name": "archon-scripts",
+      "source": "distribution/archon-scripts",
+      "mode": "install",
+      "target": ".archon/scripts",
+      "sha256": "6a679422b797c04ab4647258754396a5bc20bee9ac52af5afa069b798caa5a17"
+    },
+    {
+      "name": "agent-skills",
+      "source": "distribution/skills",
+      "mode": "install",
+      "target": ".agents/skills",
+      "sha256": "de68b15f33367b62f2e9dba2701218d82d788c09722a6723df0a81156da06935"
+    },
+    {
+      "name": "operator-skill",
+      "source": "skills/dark-factory",
+      "mode": "install",
+      "target": ".agents/skills/dark-factory",
+      "sha256": "c5b9b89c9cd03305599a18419776fe98288879caf71ae53b6bd4a0461644cdad"
+    },
+    {
+      "name": "ao-plugins",
+      "source": "ao-plugins",
+      "mode": "repository",
+      "sha256": "7e7fc5a40ddaef8aedf34af4176417c9a3206fa61e2db7e6df5b6fe713029a12"
+    }
+  ]
+}

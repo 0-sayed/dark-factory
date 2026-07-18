@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# wtc-fix-ports: Fix port collisions for parallel worktrees
+# Works with ANY project - detects port variables automatically
+# Run from inside a worktree directory after `wtc start`
+
+set -euo pipefail
+
+ENV_FILE=".env"
+
+if [[ ! -f "$ENV_FILE" ]]; then
+  echo "Error: No .env file found. Are you inside a worktree?" >&2
+  exit 1
+fi
+
+# Find worktree index by detecting any wtc-remapped port (value > 20000)
+# wtc formula: remapped = 20000 + default + index
+# We need to find index, but we don't know the default port
+
+# Strategy: Look for common infra ports that wtc remaps
+# These have known defaults, so we can calculate index
+detect_index() {
+  local port_var default_port remapped_port index
+
+  # Common infra ports with known defaults
+  declare -A known_ports=(
+    ["POSTGRES_PORT"]=5432
+    ["REDIS_PORT"]=6379
+    ["QDRANT_PORT"]=6333
+    ["MONGODB_PORT"]=27017
+    ["MYSQL_PORT"]=3306
+    ["GATEWAY_PORT"]=8000
+    ["NGINX_PORT"]=80
+  )
+
+  for port_var in "${!known_ports[@]}"; do
+    remapped_port=$(grep -E "^${port_var}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d ' "'"'" || true)
+    if [[ -n "$remapped_port" && "$remapped_port" -gt 20000 ]] 2>/dev/null; then
+      default_port=${known_ports[$port_var]}
+      index=$(( remapped_port - 20000 - default_port ))
+      if [[ "$index" -ge 1 && "$index" -le 20 ]]; then
+        echo "$index"
+        return 0
+      fi
+    fi
+  done
+
+  return 1
+}
+
+has_duplicate_remapped_ports() {
+  local ports duplicates
+  ports=$(grep -E '^[A-Z0-9_]+_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 | tr -d ' "'"'" | grep -E '^[0-9]+$' | awk '$1 > 20000' || true)
+  [[ -n "$ports" ]] || return 1
+  duplicates=$(printf '%s\n' "$ports" | sort | uniq -d)
+  [[ -n "$duplicates" ]]
+}
+
+INDEX=$(detect_index) || {
+  if grep -q '^# --- wtc port overrides ---$' "$ENV_FILE" && ! has_duplicate_remapped_ports; then
+    echo "No additional port fix needed; wtc remapped ports are already unique."
+    exit 0
+  fi
+  echo "Error: Could not detect worktree index from known ports" >&2
+  echo "Make sure wtc has set port overrides in .env" >&2
+  exit 1
+}
+
+echo "Detected worktree index: $INDEX"
+echo "Applying port fix (index * 100 offset)..."
+
+# Remove any previous fix block
+sed -i '/^# --- wtc-fix-ports ---$/,/^# --- end wtc-fix-ports ---$/d' "$ENV_FILE"
+
+# Find all *_PORT variables and their current values
+# Recalculate using: new = 20000 + (current - 20000 - index) + (index * 100)
+# Simplified: new = current + (index * 99)
+# Wait, that's wrong. Let me think again.
+#
+# Current (wrong): remapped = 20000 + default + index
+# Fixed: remapped = 20000 + default + (index * 100)
+#
+# So: fixed = current - index + (index * 100) = current + index * 99
+
+# Capture all remapped PORT variables BEFORE writing anything
+# (reading and writing the same file causes an infinite loop)
+declare -A port_fixes
+while IFS='=' read -r var value; do
+  [[ -z "$var" || "$var" =~ ^# ]] && continue
+  value=$(echo "$value" | tr -d ' "'"'")
+  if [[ "$var" =~ _PORT$ && "$value" =~ ^[0-9]+$ && "$value" -gt 20000 ]]; then
+    fixed_port=$(( value + INDEX * 99 ))
+    port_fixes[$var]="$fixed_port"
+  fi
+done < "$ENV_FILE"
+
+# Also fix DATABASE_URL and REDIS_URL if present
+db_url=$(grep -E "^DATABASE_URL=" "$ENV_FILE" | tail -1 | cut -d= -f2- | tr -d '"'"'" || true)
+redis_url=$(grep -E "^REDIS_URL=" "$ENV_FILE" | tail -1 | cut -d= -f2- | tr -d '"'"'" || true)
+
+# Now write the fix block
+{
+  echo "# --- wtc-fix-ports ---"
+  echo "# Fixed ports using index * 100 to avoid collisions"
+  for var in "${!port_fixes[@]}"; do
+    echo "${var}=${port_fixes[$var]}"
+    echo "  ${var} → ${port_fixes[$var]}" >&2
+  done
+
+  # Patch DATABASE_URL port if it contains a remapped port
+  if [[ -n "$db_url" ]]; then
+    old_pg_port=$(grep -E "^POSTGRES_PORT=" "$ENV_FILE" | tail -1 | cut -d= -f2 | tr -d ' "'"'" || true)
+    new_pg_port=${port_fixes[POSTGRES_PORT]:-}
+    if [[ -n "$old_pg_port" && -n "$new_pg_port" ]]; then
+      fixed_db_url="${db_url/:${old_pg_port}\///:${new_pg_port}\/}"
+      echo "DATABASE_URL=${fixed_db_url}"
+    fi
+  fi
+
+  # Patch REDIS_URL port if it contains a remapped port
+  if [[ -n "$redis_url" ]]; then
+    old_redis_port=$(grep -E "^REDIS_PORT=" "$ENV_FILE" | tail -1 | cut -d= -f2 | tr -d ' "'"'" || true)
+    new_redis_port=${port_fixes[REDIS_PORT]:-}
+    if [[ -n "$old_redis_port" && -n "$new_redis_port" ]]; then
+      fixed_redis_url="${redis_url/:${old_redis_port}/:${new_redis_port}}"
+      echo "REDIS_URL=${fixed_redis_url}"
+    fi
+  fi
+
+  echo "# --- end wtc-fix-ports ---"
+} >> "$ENV_FILE"
+
+echo ""
+echo "Done. Restart your services to use fixed ports."

@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# wtc-up: Fast Docker Compose startup without --build flag
+#
+# WHY THIS EXISTS:
+# `wtc start` always runs `docker compose up -d --build`
+# The --build flag triggers network checks for base image updates
+# even when images are already built and containers exist.
+# This wastes bandwidth and time on every startup.
+#
+# WHAT THIS DOES:
+# Runs `docker compose up -d` without --build
+# Skips network checks, uses existing images
+#
+# WHEN TO USE:
+# - After initial `wtc start` has built images
+# - For fast daily startup of existing worktree
+# - When you want to avoid network checks
+#
+# WHEN TO USE `wtc start` INSTEAD:
+# - First time setting up a worktree
+# - After Dockerfile changes
+# - After docker-compose.yml changes
+
+set -euo pipefail
+
+# Check we're in a directory with docker-compose.yml
+if [[ ! -f "docker-compose.yml" && ! -f "docker-compose.yaml" ]]; then
+  echo "Error: No docker-compose.yml found in current directory" >&2
+  echo "Are you inside a worktree? Run from the worktree root." >&2
+  exit 1
+fi
+
+# Check if .env exists (wtc should have created it)
+if [[ ! -f ".env" ]]; then
+  echo "Warning: No .env file found. Ports may not be remapped." >&2
+  echo "Consider running 'wtc start <index>' first." >&2
+fi
+
+echo "Starting containers (skipping --build)..."
+docker compose up -d
+
+echo ""
+echo "Containers started. No image rebuild, no network checks."
+echo "Use 'wtc start <index>' if you need to rebuild images."

@@ -1,0 +1,222 @@
+name: auto-feature
+description: start infrastructure, plan autonomously, implement, QA frontend changes, then ship PR
+provider: codex
+model: gpt-5.5
+
+nodes:
+  - id: start-infra
+    context: fresh
+    reasoning_effort: medium
+    prompt: |
+      Use the `wtc` skill to start this worktree's infrastructure, verify it is up, then output exactly `done`.
+
+  - id: start-dev
+    depends_on: [start-infra]
+    bash: |
+      node "${ARCHON_HOME:-$HOME/.archon}/scripts/ensure-dev-ready.mjs"
+
+  - id: reset-plan-status
+    depends_on: [start-dev]
+    bash: |
+      mkdir -p .archon/state
+      rm -f .archon/state/plan-status.txt
+
+  - id: plan-feature
+    depends_on: [reset-plan-status]
+    context: fresh
+    reasoning_effort: xhigh
+    prompt: |
+      Use Superpowers brainstorming and writing-plans discipline, but run fully autonomously.
+
+      Selected task request:
+      $ARGUMENTS
+
+      Goal: create the planning artifacts needed to implement only the selected task from the request above. Do not implement. Do not commit. Do not ask the user questions.
+
+      Supported request forms:
+      - Full packet from Dark Factory:
+        Selected task packet:
+        taskId: T003
+        title: Feature name
+        branchName: feat/t003
+        tasksPath: planning/roadmap/tasks.md
+        dependsOn: T001
+        contextFiles: planning/context.md
+      - Manual shorthand:
+        T003
+        T003 - Feature name
+        Feature name
+
+      Required context:
+      - If the request includes `tasksPath`, read that tasks file.
+      - If the request omits `tasksPath`, locate the first existing tasks file from: `planning/roadmap/tasks.md`, `planning/tasks.md`, `tasks.md`.
+      - If the request is a task id such as `T003`, find that exact task in the tasks file and use its title, branch, dependencies, and context.
+      - If the request is a feature name, find the matching task title in the tasks file; if there is no clear match, plan the smallest feature matching the provided name.
+      - Read the task's listed `contextFiles` when present.
+      - Read nearby planning context only when it is needed to understand this exact task.
+
+      Rules:
+      - Treat the selected task request as the workflow contract.
+      - Do not plan a different task, a broader dependency group, or the whole project.
+      - Create the planning artifacts using Superpowers writing-plans conventions.
+      - Assume the Superpowers planning folders are empty at the start of this feature.
+      - If intent is missing, make the safest small-scope assumption and record it.
+      - If useful, use sub-agents, codebase scanning, Context7, or online search to gather enough evidence for a solid plan, then make the final decisions yourself and continue without waiting for user input.
+      - If multiple approaches or recommendations exist, evaluate them briefly, choose the best recommended approach, and apply it directly to the planning artifacts; do not leave advisory notes or unresolved options.
+
+      Output contract:
+      - Self-review the created artifacts for placeholders, contradictions, stale context, vague steps, missing exact paths, and missing verification.
+      - Fix issues inline before finishing.
+      - When planning is fully complete, write exactly `PLAN_READY` to `.archon/state/plan-status.txt`.
+      - Output exactly `PLAN_READY` when done.
+
+  - id: check-plan-ready
+    depends_on: [plan-feature]
+    bash: |
+      if [ -f .archon/state/plan-status.txt ] && [ "$(cat .archon/state/plan-status.txt)" = "PLAN_READY" ]; then
+        printf 'yes'
+      else
+        printf 'no'
+        echo "plan-feature did not write .archon/state/plan-status.txt with PLAN_READY" >&2
+        exit 1
+      fi
+
+  - id: reset-implement-status
+    depends_on: [check-plan-ready]
+    bash: |
+      node "${ARCHON_HOME:-$HOME/.archon}/scripts/initialize-sdd-workspace.mjs" >/dev/null
+      mkdir -p .archon/state
+      rm -f .archon/state/implement-status.json
+      rm -f .archon/state/implement-progress.json
+
+  - id: implement
+    depends_on: [reset-implement-status]
+    context: fresh
+    # Progress heartbeat is for observability only: Archon can be quiet while the Codex node is still doing tool work.
+    # Completion is still gated solely by implement-status.json containing exactly {"status":"DONE"}.
+    prompt: |
+      Using superpowers, implement the plan using sub-agent driven development, and don't commit anything.
+
+      Use the installed subagent-driven-development skill helpers for all SDD scratch; never create .superpowers/sdd directly.
+
+      Find the most recently dated file in docs/superpowers/plans/ and read it.
+      Also check docs/superpowers/specs/ - if any file exists there, read the most recently dated one too.
+      These two files together define what needs to be built.
+      Run fully autonomously: if issues or tradeoffs appear, evaluate them briefly, choose the best recommended approach, apply it directly, and continue without waiting for user input.
+      During implementation, after each completed slice and before any long validation command, use a shell tool call to update:
+      .archon/state/implement-progress.json
+
+      Progress file contents must be concise JSON:
+      {"status":"WORKING","lastAction":"brief description","updatedAt":"YYYY-MM-DDTHH:MM:SSZ"}
+
+      After finishing implementation, run the repo validation command and fix any failures.
+
+      When implementation is fully complete, use a shell tool call to write this file exactly once at the very end:
+      .archon/state/implement-status.json
+
+      File contents must be exactly:
+      {"status":"DONE"}
+
+  - id: check-implement-done
+    depends_on: [implement]
+    bash: |
+      if [ -f .archon/state/implement-status.json ] && grep -qx '{"status":"DONE"}' .archon/state/implement-status.json; then
+        printf 'yes'
+      else
+        printf 'no'
+        echo "implement node did not write .archon/state/implement-status.json with DONE" >&2
+        exit 1
+      fi
+
+  - id: check-frontend
+    depends_on: [check-implement-done]
+    when: "$check-implement-done.output == 'yes'"
+    bash: |
+      node "${ARCHON_HOME:-$HOME/.archon}/scripts/frontend-qa-context.mjs" --mode feature
+
+  - id: ensure-dev-for-QA
+    depends_on: [check-frontend]
+    when: "$check-frontend.output == 'yes'"
+    bash: |
+      node "${ARCHON_HOME:-$HOME/.archon}/scripts/ensure-dev-ready.mjs"
+
+  - id: QA
+    depends_on: [ensure-dev-for-QA]
+    context: fresh
+    idle_timeout: 600000
+    prompt: |
+      Use the `vercel-browser` skill to QA only the frontend scope recorded in:
+      .archon/state/frontend-qa-context.json
+
+      Contract:
+      - Read the QA context file first.
+      - Open the `appUrl` from that file.
+      - Do not start dev servers from this QA node; auto-feature already has a start-dev node. If `appUrl` is unreachable, output exactly `QA_BLOCKED`.
+      - Exercise only the changed frontend surface listed in `frontendFiles`.
+      - Fix only issues necessary for the changed frontend surface to work.
+      - If the blocker is related backend/API/config/test code, make the appropriate scoped fix and re-check with focused validation plus browser QA.
+      - Prefer the fix that preserves intended product behavior and existing architecture; avoid band-aids and broad unrelated cleanup.
+      - Do not fix unrelated product areas, infrastructure, dependency, environment, formatting, or broad cleanup issues.
+      - If a backend/API request required by the changed frontend surface fails for an unrelated reason, write notes, do not write `QA_PASSED`, and output exactly `QA_BLOCKED`.
+      - If you find a feature-specific bug, make the appropriate scoped fix and re-check it in the browser.
+      - Write concise notes to .archon/state/frontend-qa-result.md.
+      - When the scoped browser QA passes, write exactly `QA_PASSED` to .archon/state/frontend-qa-status.txt.
+      - Output exactly `QA_PASSED`.
+
+  - id: record-QA-revision
+    depends_on: [QA]
+    bash: |
+      node "${ARCHON_HOME:-$HOME/.archon}/scripts/record-frontend-qa-revision.mjs"
+
+  - id: check-QA-passed
+    depends_on: [record-QA-revision]
+    bash: |
+      node "${ARCHON_HOME:-$HOME/.archon}/scripts/check-frontend-qa-status.mjs"
+
+  - id: reset-roadmap-sync-status
+    depends_on: [check-frontend, check-QA-passed]
+    trigger_rule: none_failed_min_one_success
+    bash: |
+      mkdir -p .archon/state
+      rm -f .archon/state/roadmap-sync-status.txt
+
+  - id: sync-roadmap-status
+    depends_on: [reset-roadmap-sync-status]
+    context: fresh
+    prompt: |
+      Update the roadmap status for the selected task before the PR commit.
+
+      Selected task request:
+      $ARGUMENTS
+
+      Contract:
+      - Locate the tasks file from `tasksPath` in the selected task packet; if omitted, use the first existing file from `planning/roadmap/tasks.md`, `planning/tasks.md`, `tasks.md`.
+      - Resolve the selected task by exact task id when present, otherwise by the selected task title.
+      - In the Task Graph table, mark only the selected task as `[x]`.
+      - Preserve task ids, titles, dependencies, branches, context paths, table structure, and unrelated rows.
+      - Do not commit.
+      - Write exactly `ROADMAP_SYNCED` to `.archon/state/roadmap-sync-status.txt`.
+      - Output exactly `ROADMAP_SYNCED`.
+
+  - id: check-roadmap-synced
+    depends_on: [sync-roadmap-status]
+    bash: |
+      if [ -f .archon/state/roadmap-sync-status.txt ] && [ "$(cat .archon/state/roadmap-sync-status.txt)" = "ROADMAP_SYNCED" ]; then
+        printf 'yes'
+      else
+        printf 'no'
+        echo "sync-roadmap-status did not write .archon/state/roadmap-sync-status.txt with ROADMAP_SYNCED" >&2
+        exit 1
+      fi
+
+  - id: commit  
+    depends_on: [check-roadmap-synced]
+    context: fresh
+    prompt: |
+      Use the `commit` skill, but exclude any files inside superpowers folder, codex.review.md.
+      Do not open a PR from the commit step.
+
+  - id: ship
+    depends_on: [commit]
+    prompt: |
+      Use the `ship` skill to push the current branch and open or update the PR.

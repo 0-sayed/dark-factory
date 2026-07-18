@@ -1,0 +1,4 @@
+interface:
+  display_name: "Dark Factory"
+  short_description: "Operate and recover Dark Factory projects safely"
+  default_prompt: "Inspect and operate this Dark Factory project through its controller."

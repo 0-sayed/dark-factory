@@ -1,0 +1,9 @@
+{
+  "type": "module",
+  "scripts": {
+    "test": "node --test *.test.js",
+    "verify:dependencies": "node ../scripts/verify-dependencies.mjs",
+    "verify:distribution": "node ../scripts/manage-distribution.mjs verify-source",
+    "doctor": "node ../scripts/manage-distribution.mjs doctor"
+  }
+}

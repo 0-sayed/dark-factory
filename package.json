@@ -1,0 +1,7 @@
+{
+  "name": "dark-factory",
+  "private": true,
+  "scripts": {
+    "validate": "node scripts/validate.mjs"
+  }
+}

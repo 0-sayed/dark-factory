@@ -1,0 +1,45 @@
+# Legacy single-project config example.
+# Normal onboarding uses:
+# node orchestrator/dark-factory.js init --project my-project --planning ../my-project/planning
+#
+# Keep this only for explicit --project-config compatibility.
+# id and name are optional; when omitted, the project folder name is used.
+planningPath: ../../my-project/planning
+
+# AO execution adapter for feature workers.
+workerPlugin: archon
+
+# Optional. Defaults to `ao`; set this when AO is not installed on PATH.
+# aoCommand: ao
+
+# Default when planningPath is used: roadmap/tasks.md inside the planning folder.
+# tasksFile: roadmap/tasks.md
+
+# Optional. Defaults to `.env -> .env` when `.env` exists.
+# Falls back to `.env.example -> .env` only when real `.env` is absent.
+# Copied into each AO worktree only when the target file is missing.
+# envFiles: .env -> .env
+
+# Optional. Project-specific runtime env injected into each worker after Dark
+# Factory allocates ports. Available tokens: ${apiPort}, ${webPort},
+# ${projectId}, ${sessionId}, ${issueId}.
+# runtimeEnv: |
+#   PUBLIC_API_URL=http://127.0.0.1:${apiPort}
+
+# Optional. Run in completed worker worktrees before AO removes the worktree.
+# Recommended for worktree-compose projects; Dark Factory still falls back to
+# Docker Compose labels if compose resources survive after the worktree is gone.
+# Keep destructive cleanup explicit per project.
+# cleanupCommands: |
+#   pnpm wtc down --volumes
+
+# Optional if you prefer pointing at the repo root instead of planningPath.
+# path: ../../my-project
+# tasksPath: planning/roadmap/tasks.md
+
+archonWorkflow: auto-feature
+archonInstruction: |
+  Use the planning folder as the source of truth.
+  Work only on the AO task id for this session.
+  AO owns the worktree, so run Archon with --no-worktree.
+  Complete the task through implementation, roadmap sync, commit, ship, and auto-merge prepare.

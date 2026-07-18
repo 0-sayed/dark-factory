@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+    echo "Usage: chrome-auth-save <url> [name-override]" >&2
+    exit 1
+fi
+
+TARGET_URL=$1
+AUTH_NAME=${2:-}
+
+sanitize_name() {
+    printf '%s' "$1" | sed 's/[^A-Za-z0-9._-]/_/g'
+}
+
+default_name_from_url() {
+    node -e 'console.log(new URL(process.argv[1]).origin.replace(/[^A-Za-z0-9._-]/g, "_"))' "$1"
+}
+
+get_worktree_index() {
+    local current_root
+    current_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)
+    local index=0
+    while IFS= read -r -d '' field; do
+        [[ "$field" == worktree\ * ]] || continue
+        local wt_path
+        wt_path=${field#worktree }
+        wt_path=$(cd "$wt_path" 2>/dev/null && pwd -P || echo "$wt_path")
+        [[ "$current_root" == "$wt_path" ]] && echo "$index" && return
+        ((index++))
+    done < <(git worktree list --porcelain -z 2>/dev/null)
+    echo "0"
+}
+
+WT_INDEX=$(get_worktree_index)
+DEBUG_PORT=$((9222 + WT_INDEX))
+SESSION="wt${WT_INDEX}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/vercel-browser/auth"
+AUTH_NAME=${AUTH_NAME:-$(default_name_from_url "$TARGET_URL")}
+AUTH_NAME=$(sanitize_name "$AUTH_NAME")
+AUTH_FILE="$STATE_DIR/${AUTH_NAME}.json"
+
+umask 077
+mkdir -p "$STATE_DIR"
+
+if ! curl -fsS --max-time 1 "http://127.0.0.1:${DEBUG_PORT}/json/version" > /dev/null 2>&1; then
+    echo "Chrome is not running on port $DEBUG_PORT. Start it with chrome-launch first." >&2
+    exit 1
+fi
+
+node "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/chrome-auth-state.mjs" save \
+    --port "$DEBUG_PORT" \
+    --url "$TARGET_URL" \
+    --file "$AUTH_FILE"

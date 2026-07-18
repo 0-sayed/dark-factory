@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+LOG_FILE="$TMP_DIR/calls.log"
+VERIFY_COUNT_FILE="$TMP_DIR/verify-count"
+touch "$VERIFY_COUNT_FILE"
+
+fake_tool() {
+    local name=$1
+    local body=$2
+    local path="$TMP_DIR/$name"
+    printf '%s\n' "$body" > "$path"
+    chmod +x "$path"
+    echo "$path"
+}
+
+LOAD_BIN=$(fake_tool chrome-auth-load '#!/usr/bin/env bash
+set -euo pipefail
+echo "load $*" >> "$TEST_LOG_FILE"
+exit "${TEST_LOAD_STATUS:-0}"
+')
+
+SAVE_BIN=$(fake_tool chrome-auth-save '#!/usr/bin/env bash
+set -euo pipefail
+echo "save $*" >> "$TEST_LOG_FILE"
+')
+
+VERIFY_BIN=$(fake_tool chrome-auth-verify '#!/usr/bin/env bash
+set -euo pipefail
+count=$(cat "$TEST_VERIFY_COUNT_FILE" 2>/dev/null || echo 0)
+count=$((count + 1))
+echo "$count" > "$TEST_VERIFY_COUNT_FILE"
+echo "verify $*" >> "$TEST_LOG_FILE"
+if [[ "$count" -lt "${TEST_VERIFY_PASS_AT:-1}" ]]; then
+  exit 1
+fi
+')
+
+LOGIN_BIN=$(fake_tool login '#!/usr/bin/env bash
+set -euo pipefail
+echo "login" >> "$TEST_LOG_FILE"
+')
+
+run_ensure() {
+    env \
+        TEST_LOG_FILE="$LOG_FILE" \
+        TEST_VERIFY_COUNT_FILE="$VERIFY_COUNT_FILE" \
+        CHROME_AUTH_LOAD_BIN="$LOAD_BIN" \
+        CHROME_AUTH_SAVE_BIN="$SAVE_BIN" \
+        CHROME_AUTH_VERIFY_BIN="$VERIFY_BIN" \
+        "$@" \
+        bash "$SCRIPT_DIR/chrome-auth-ensure" http://127.0.0.1:3000 app-auth
+}
+
+assert_log() {
+    local expected=$1
+    local actual
+    actual=$(cat "$LOG_FILE")
+    if [[ "$actual" != "$expected" ]]; then
+        echo "Unexpected log:" >&2
+        printf '%s\n' "$actual" >&2
+        echo "Expected:" >&2
+        printf '%s\n' "$expected" >&2
+        exit 1
+    fi
+}
+
+run_ensure TEST_VERIFY_PASS_AT=1
+assert_log "load http://127.0.0.1:3000 app-auth
+verify http://127.0.0.1:3000"
+
+: > "$LOG_FILE"
+echo 0 > "$VERIFY_COUNT_FILE"
+run_ensure TEST_VERIFY_PASS_AT=2 BROWSER_AUTH_LOGIN_COMMAND="$LOGIN_BIN"
+assert_log "load http://127.0.0.1:3000 app-auth
+verify http://127.0.0.1:3000
+login
+save http://127.0.0.1:3000 app-auth
+verify http://127.0.0.1:3000"
+
+: > "$LOG_FILE"
+echo 0 > "$VERIFY_COUNT_FILE"
+if run_ensure TEST_VERIFY_PASS_AT=99 > "$TMP_DIR/no-login.out" 2>&1; then
+    echo "Expected ensure to fail without a login command" >&2
+    exit 1
+fi
+
+echo "chrome-auth-ensure tests passed"

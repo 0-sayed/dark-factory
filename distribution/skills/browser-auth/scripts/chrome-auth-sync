@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+    echo "Usage: chrome-auth-sync <chrome-pid> <debug-port> [interval-seconds]" >&2
+    exit 1
+fi
+
+CHROME_PID=$1
+DEBUG_PORT=$2
+INTERVAL=${3:-5}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if ! [[ "$INTERVAL" =~ ^[0-9]+$ ]] || [[ "$INTERVAL" -lt 1 ]]; then
+    echo "Error: interval must be a positive integer" >&2
+    exit 1
+fi
+
+while kill -0 "$CHROME_PID" 2>/dev/null; do
+    while IFS= read -r origin; do
+        [[ -n "$origin" ]] || continue
+        "$SCRIPT_DIR/chrome-auth-save" "$origin" >/dev/null 2>&1 || true
+    done < <(node "$SCRIPT_DIR/chrome-auth-state.mjs" origins --port "$DEBUG_PORT" 2>/dev/null || true)
+    sleep "$INTERVAL"
+done

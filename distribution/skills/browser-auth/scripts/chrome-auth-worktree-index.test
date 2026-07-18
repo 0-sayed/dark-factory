@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+PROJECT_DIR="$TMP_DIR/project with spaces"
+BIN_DIR="$TMP_DIR/bin"
+HOME_DIR="$TMP_DIR/home"
+STATE_DIR="$TMP_DIR/state/vercel-browser/auth"
+NODE_LOG="$TMP_DIR/node.log"
+
+mkdir -p "$PROJECT_DIR" "$BIN_DIR" "$HOME_DIR" "$STATE_DIR"
+
+cat > "$BIN_DIR/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  rev-parse)
+    echo "$TEST_PROJECT_DIR"
+    ;;
+  worktree)
+    if [[ "${2:-}" == "list" && "${3:-}" == "--porcelain" && "${4:-}" == "-z" ]]; then
+      printf 'worktree /tmp/other-worktree\0HEAD 123456\0branch refs/heads/other\0\0'
+      printf 'worktree %s\0HEAD abcdef\0branch refs/heads/main\0\0' "$TEST_PROJECT_DIR"
+      exit 0
+    fi
+    exit 1
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+EOF
+
+cat > "$BIN_DIR/curl" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+
+cat > "$BIN_DIR/node" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$TEST_NODE_LOG"
+EOF
+
+chmod +x "$BIN_DIR/git" "$BIN_DIR/curl" "$BIN_DIR/node"
+
+cat > "$STATE_DIR/app-auth.json" <<'EOF'
+{
+  "savedAt": "2026-01-01T00:00:00.000Z",
+  "url": "http://127.0.0.1:3000",
+  "cookies": [{ "name": "sid", "value": "abc", "domain": "127.0.0.1", "path": "/" }],
+  "origins": []
+}
+EOF
+
+run_auth_script() {
+    local script=$1
+    shift
+    (
+        cd "$PROJECT_DIR"
+        env \
+            HOME="$HOME_DIR" \
+            PATH="$BIN_DIR:$PATH" \
+            TEST_NODE_LOG="$NODE_LOG" \
+            TEST_PROJECT_DIR="$PROJECT_DIR" \
+            XDG_STATE_HOME="$TMP_DIR/state" \
+            CHROME_AUTH_STATE_BIN="$TMP_DIR/chrome-auth-state.mjs" \
+            bash "$SCRIPT_DIR/$script" "$@"
+    )
+}
+
+assert_last_port() {
+    local args
+    args=$(tail -n 1 "$NODE_LOG")
+    if [[ "$args" != *"--port 9223"* ]]; then
+        echo "Expected $1 to use worktree-derived port 9223, got: $args" >&2
+        exit 1
+    fi
+}
+
+run_auth_script chrome-auth-load http://127.0.0.1:3000 app-auth
+assert_last_port chrome-auth-load
+
+run_auth_script chrome-auth-save http://127.0.0.1:3000 app-auth
+assert_last_port chrome-auth-save
+
+run_auth_script chrome-auth-verify http://127.0.0.1:3000
+assert_last_port chrome-auth-verify
+
+echo "chrome-auth worktree index tests passed"
