@@ -75,7 +75,7 @@ function shellTemplate(value) {
     .replace(/"/g, "\\\"")
     .replace(/\$\{([A-Za-z][A-Za-z0-9_]*)\}/g, (_match, name) => {
       const variable = variables[name];
-      return variable ? `\${${variable}}` : "";
+      return variable ? `\${${variable}}` : _match;
     })
     .replace(/\$/g, "\\$")
     .replace(/\\\$\{(dark_factory_[A-Za-z0-9_]+)\}/g, "${$1}")}"`;
@@ -97,7 +97,7 @@ function resolveRuntimeEnv(agentConfig, ports, context = {}) {
 
   return Object.fromEntries(runtimeEnvEntries(agentConfig).map(([key, value]) => [
     key,
-    value.replace(/\$\{([A-Za-z][A-Za-z0-9_]*)\}/g, (_match, name) => replacements[name] ?? ""),
+    value.replace(/\$\{([A-Za-z][A-Za-z0-9_]*)\}/g, (_match, name) => replacements[name] ?? _match),
   ]));
 }
 

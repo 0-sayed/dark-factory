@@ -553,6 +553,37 @@ test("archon agent keeps project runtime env configurable", () => {
   assert.doesNotMatch(command, /export VITE_API_URL=/);
 });
 
+test("archon agent preserves unknown runtime env template placeholders", () => {
+  const agent = plugin.create();
+  const environment = agent.getEnvironment({
+    sessionId: "sample-2",
+    issueId: "T002",
+    projectConfig: {
+      agentConfig: {
+        darkFactoryProjectId: "sample",
+        runtimeEnv: {
+          DATABASE_URL: "mongodb://${MONGO_HOST}:${MONGO_PORT}/${issueId}",
+        },
+      },
+    },
+  });
+  const command = agent.getLaunchCommand({
+    sessionId: "sample-2",
+    issueId: "T002",
+    projectConfig: {
+      agentConfig: {
+        darkFactoryProjectId: "sample",
+        runtimeEnv: {
+          DATABASE_URL: "mongodb://${MONGO_HOST}:${MONGO_PORT}/${issueId}",
+        },
+      },
+    },
+  });
+
+  assert.equal(environment.DATABASE_URL, "mongodb://${MONGO_HOST}:${MONGO_PORT}/T002");
+  assert.match(command, /export DATABASE_URL="mongodb:\/\/\\\$\{MONGO_HOST\}:\\\$\{MONGO_PORT\}\/\$\{dark_factory_issue_id\}"/);
+});
+
 test("archon agent skips launch and reporting when AO did not assign a task", () => {
   const agent = plugin.create();
   const command = agent.getLaunchCommand({
